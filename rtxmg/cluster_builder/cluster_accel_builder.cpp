@@ -1040,11 +1040,11 @@ void ClusterAccelBuilder::BuildBlasFromClas(ClusterAccels& accels, std::span<Ins
 void ClusterAccelBuilder::UpdateMemoryAllocations(ClusterAccels& accels, uint32_t numInstances, uint32_t sceneSubdPatches)
 {
     uint32_t maxClusters = std::min(kMaxApiClusterCount, m_tessellatorConfig.memorySettings.maxClusters);
-    maxClusters = std::max(1u, maxClusters);
+    maxClusters = std::max(uint32_t(1), maxClusters);
 
     // Reallocate memory if settings changed
     size_t maxClusterBlocks = (m_tessellatorConfig.memorySettings.clasBufferBytes + (size_t(cluster::kClasByteAlignment) - 1ull)) / size_t(cluster::kClasByteAlignment);
-    maxClusterBlocks = std::max(1ull, maxClusterBlocks);
+    maxClusterBlocks = std::max(size_t(1), maxClusterBlocks);
     size_t maxClasBytes = size_t(cluster::kClasByteAlignment) * maxClusterBlocks;
 
     uint32_t maxVertices = uint32_t(m_tessellatorConfig.memorySettings.vertexBufferBytes / sizeof(float3));

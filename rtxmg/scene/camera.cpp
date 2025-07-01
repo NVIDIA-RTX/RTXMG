@@ -65,7 +65,7 @@ void Camera::Roll(float speed)
     auto const& basis = GetBasis();
     float3 u = normalize(basis[0]);
     float3 v = normalize(basis[1]);
-    m_up = u * cos(radians(90.0f + speed)) + v * sin(radians(90.0f + speed));
+    m_up = u * cosf(radians(90.0f + speed)) + v * sinf(radians(90.0f + speed));
     m_changed = true;
 }
 

@@ -26,6 +26,7 @@
 #include <donut/core/log.h>
 #include <donut/core/math/math.h>
 #include <cassert>
+#include <cstdarg>
 #include <iostream>
 #include <iterator>
 #include <fstream>
@@ -49,6 +50,17 @@ logassert(cond, "Malformed material file %s:%d: %s", m_filepath, lineNumber, msg
 
 #define obj_assert(cond, msg) \
 logassert(cond, "Malformed obj file %s:%d: %s", m_filepath, lineNumber, msg)
+
+#ifndef _MSC_VER
+int sscanf_s( const char *buffer, const char *format, ...) 
+{
+    va_list args;
+    va_start(args,format);
+    int result = vsscanf(buffer, format, args);
+    va_end(args);
+    return result;
+}
+#endif
 
 static std::vector<std::unique_ptr<Shape::material>>
 parseMtllib(const char* m_filepath)

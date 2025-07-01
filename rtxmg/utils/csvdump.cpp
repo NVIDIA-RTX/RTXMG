@@ -20,10 +20,13 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#include "rtxmg/utils/debug.h"
+
+#include <cmath>
 #include <iomanip>
 #include <fstream>
 
-#include "rtxmg/utils/debug.h"
+
 
 void WriteTexToCSV(nvrhi::ICommandList* commandList, nvrhi::ITexture* tex, char const filename[])
 {
@@ -45,7 +48,7 @@ void WriteTexToCSV(nvrhi::ICommandList* commandList, nvrhi::ITexture* tex, char 
         for (uint32_t x = 0; x < desc.width; x++)
         {
             float z = pData[y * rowPitch / sizeof(float) + x];
-            if (isinf(z))
+            if (std::isinf(z))
                 z = -1.0f;
             debugDump << std::setw(8) << std::right << z;
             if (x < desc.width - 1)

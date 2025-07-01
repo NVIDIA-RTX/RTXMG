@@ -24,7 +24,7 @@
 
 nvrhi::BufferDesc GetGenericDesc(size_t nElements, uint32_t elementSize, const char* name, nvrhi::Format format)
 {
-    nElements = std::max(1ull, nElements);
+    nElements = std::max(size_t(1), nElements);
     return nvrhi::BufferDesc()
         .setByteSize(nElements * elementSize)
         .setCanHaveTypedViews(true)

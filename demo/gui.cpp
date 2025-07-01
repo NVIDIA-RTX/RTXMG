@@ -292,7 +292,7 @@ void UserInterface::BuildUIMain(int2 screenLayoutSize)
     UIData& uiData = GetApp().GetUIData();
 
     auto& renderer = m_app.GetRenderer();
-
+#ifdef _WIN32
     KORGI_BUTTON_CALLBACK(0, Play, [this]()
     {
         TimeLineEditorState& state = GetApp().GetUIData().timeLineEditorState;
@@ -349,7 +349,7 @@ void UserInterface::BuildUIMain(int2 screenLayoutSize)
     {
         GetApp().SetFineTessellationRate(val / 1000.0f);
     });
-
+#endif
     ImVec2 itemSize = ImGui::GetItemRectSize();
 
     const char* kWindowName = "Settings";
@@ -715,7 +715,7 @@ void UserInterface::BuildUIMain(int2 screenLayoutSize)
             ImGui::PushStyleColor(ImGuiCol_FrameBg, kHighlightColor);
         if (ImGui::InputInt("Vertex Memory (MB)", &vertexMB, 128, 512, ImGuiInputTextFlags_EnterReturnsTrue))
         {
-            memSettings.vertexBufferBytes = std::min(size_t(std::max(vertexMB, 128)), 8192ull) << 20ull;
+            memSettings.vertexBufferBytes = std::min(size_t(std::max(vertexMB, 128)), size_t(8192)) << 20ull;
             memSettingsChanged = true;
         }
         if (ImGui::IsItemHovered() && ImGui::GetCurrentContext()->HoveredIdTimer > .5f)
@@ -727,7 +727,7 @@ void UserInterface::BuildUIMain(int2 screenLayoutSize)
             ImGui::PushStyleColor(ImGuiCol_FrameBg, kHighlightColor);
         if (ImGui::InputInt("CLAS Memory (MB)", &clasMB, 128, 512, ImGuiInputTextFlags_EnterReturnsTrue))
         {
-            memSettings.clasBufferBytes = std::min(size_t(std::max(clasMB, 128)), 8192ull) << 20ull;
+            memSettings.clasBufferBytes = std::min(size_t(std::max(clasMB, 128)), size_t(8192)) << 20ull;
             memSettingsChanged = true;
         }
         if (ImGui::IsItemHovered() && ImGui::GetCurrentContext()->HoveredIdTimer > .5f)
@@ -1706,7 +1706,7 @@ ImFont* UserInterface::AddFontFromMemoryCompressedBase85TTF(
     return imFont;
 }
 
-bool UserInterface::FolderDialog(std::string& m_filepath)
+bool UserInterface::FolderDialog(std::string& filepath)
 {
 #ifdef _WIN32
     IFileOpenDialog* dlg;
@@ -1731,7 +1731,7 @@ bool UserInterface::FolderDialog(std::string& m_filepath)
             {
                 hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &path);
                 std::wstring_convert<std::codecvt_utf8<wchar_t>, wchar_t> converter;
-                m_filepath = converter.to_bytes(path);
+                filepath = converter.to_bytes(path);
 
                 pItem->Release();
             }
@@ -1762,7 +1762,7 @@ bool UserInterface::FolderDialog(std::string& m_filepath)
 }
 
 bool UserInterface::FileDialog(bool bOpen, char const* filters,
-    std::string& m_filepath)
+    std::string& filepath)
 {
 #ifdef _WIN32
     IFileOpenDialog* dlg;
@@ -1816,7 +1816,7 @@ bool UserInterface::FileDialog(bool bOpen, char const* filters,
 
                 std::wstring_convert<std::codecvt_utf8<wchar_t>, wchar_t> converter;
 
-                m_filepath = converter.to_bytes(path);
+                filepath = converter.to_bytes(path);
 
                 pItem->Release();
             }

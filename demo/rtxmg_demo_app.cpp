@@ -38,6 +38,7 @@
 #include "rtxmg/scene/scene.h"
 #include "rtxmg/subdivision/subdivision_surface.h"
 #include "rtxmg/cluster_builder/tessellator_config.h"
+#include "rtxmg/subdivision/shape.h"
 #include "rtxmg/utils/buffer.h"
 #include "rtxmg/utils/debug.h"
 
@@ -295,6 +296,7 @@ bool RTXMGDemoApp::Init()
         donut::log::fatal("Failed to enumerate adapters for vram check");
     }
 
+#ifdef _WIN32
     ID3D12Device* rawDevice = (ID3D12Device*)GetDevice()->getNativeObject(nvrhi::ObjectTypes::D3D12_Device);
 
     for (const auto& adapter : adapters)
@@ -313,7 +315,7 @@ bool RTXMGDemoApp::Init()
             }
         }
     }
-
+#endif
     std::filesystem::path sceneFileName;
     if (!m_args.meshInputFile.empty())
     {
@@ -689,7 +691,7 @@ void RTXMGDemoApp::UpdateDLSSSettings()
         }
     }
 #else
-    denoiserMode = DenoiserMode::None;
+    DenoiserMode denoiserMode = DenoiserMode::None;
 #endif
 
     // Off, or disabled due to invalid settings.

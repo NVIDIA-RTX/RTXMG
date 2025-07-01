@@ -37,6 +37,7 @@
 #include <donut/engine/CommonRenderPasses.h>
 #include <nvrhi/utils.h>
 
+#include <cmath>
 #include <filesystem>
 #include <string>
 #include <sstream>
@@ -708,7 +709,7 @@ void RTXMGRenderer::SetRenderCamera(Camera& camera, bool isCameraCut)
     }
 
     const uint32_t kBasePhaseCount = 8;
-    uint32_t phaseCount = uint32_t(std::ceilf(kBasePhaseCount * powf(float(m_displaySize.y) / float(m_renderSize.y), 2.0f)));
+    uint32_t phaseCount = uint32_t(std::ceil(kBasePhaseCount * powf(float(m_displaySize.y) / float(m_renderSize.y), 2.0f)));
     uint32_t index = (m_params.subFrameIndex % phaseCount) + 1;
     m_params.jitter = float2{ VanDerCorput(2, index), VanDerCorput(3, index) } - 0.5f;
 

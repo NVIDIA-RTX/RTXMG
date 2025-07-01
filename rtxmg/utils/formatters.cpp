@@ -22,10 +22,11 @@
 
 #include "rtxmg/utils/formatters.h"
 
-#include <assert.h>
+#include <array>
+#include <cassert>
+#include <cstdint>
 #include <cstdio>
 #include <cmath>
-#include <xutility>
 
 int HumanFormatter(double value, char* buff, int bufsize, void*)
 {

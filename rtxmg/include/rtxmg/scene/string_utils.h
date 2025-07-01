@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <string>

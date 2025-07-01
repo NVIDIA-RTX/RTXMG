@@ -78,6 +78,8 @@ enum class DenoiserMode
 
 #ifdef __cplusplus
 #include <array>
+#include <cstdlib>
+
 constexpr auto kColorModeNames = std::to_array<const char *>(
 {
     "Base Color",

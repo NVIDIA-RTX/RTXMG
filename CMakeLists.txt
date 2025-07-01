@@ -13,7 +13,6 @@ set(CMAKE_FIND_ROOT_PATH ${CMAKE_SOURCE_DIR}/extern)
 # Static analysis
 ####################################
 set(RULESET_PATH "${CMAKE_SOURCE_DIR}/rtxmg_static_analysis.ruleset")
-add_compile_options("-wd26495")
 set_property( GLOBAL PROPERTY VS_USER_PROPS "rtxmg_static_analysis.props")
 
 ####################################
@@ -51,7 +50,7 @@ include("${PROJECT_SOURCE_DIR}/CMake/FetchDXC.cmake")
 ####################################
 # Streamline
 ####################################
-set(DONUT_WITH_STREAMLINE ON CACHE BOOL "" FORCE)
+#set(DONUT_WITH_STREAMLINE ON CACHE BOOL "" FORCE)
 set(DONUT_STREAMLINE_FETCH_URL "https://github.com/NVIDIAGameWorks/Streamline.git" CACHE STRING "")
 set(DONUT_STREAMLINE_FETCH_TAG "v2.7.2" CACHE STRING "")
 set(STREAMLINE_FEATURE_DLSS_SR ON CACHE BOOL "" FORCE)

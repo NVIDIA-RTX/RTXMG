@@ -20,8 +20,6 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#pragma once
-
 #include "scan_system.h"
 
 #include <nvrhi/utils.h>

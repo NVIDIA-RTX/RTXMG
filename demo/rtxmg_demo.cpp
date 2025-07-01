@@ -27,14 +27,16 @@
 #include <nvrhi/utils.h>
 
 extern "C" {
+#ifdef _WIN32
+    #ifdef DONUT_D3D_AGILITY_SDK_ENABLED
+        _declspec(dllexport) extern const UINT D3D12SDKVersion = DONUT_D3D_AGILITY_SDK_VERSION;
+        _declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\";
+    #endif
 
-#ifdef DONUT_D3D_AGILITY_SDK_ENABLED
-    _declspec(dllexport) extern const UINT D3D12SDKVersion = DONUT_D3D_AGILITY_SDK_VERSION;
-    _declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\";
-#endif
-
-    _declspec(dllexport) DWORD NvOptimusEnablement = 0x0000001;
+        _declspec(dllexport) DWORD NvOptimusEnablement = 0x0000001;
+#endif        
 }
+
 
 #include "rtxmg_demo_app.h"
 #include "gui.h"
