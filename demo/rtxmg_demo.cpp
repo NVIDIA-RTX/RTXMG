@@ -51,9 +51,9 @@ int main(int argc, const char** argv)
     donut::log::EnableOutputToMessageBox(true);
 
     nvrhi::GraphicsAPI api = app::GetGraphicsAPIFromCommandLine(argc, argv);
-    if (api != nvrhi::GraphicsAPI::D3D12)
+    if (api != nvrhi::GraphicsAPI::D3D12 && api != nvrhi::GraphicsAPI::VULKAN)
     {
-        donut::log::fatal("This demo requires D3D12");
+        donut::log::fatal("This demo requires D3D12 or Vulkan");
     }
 
     app::DeviceManager* deviceManager = app::DeviceManager::Create(api);

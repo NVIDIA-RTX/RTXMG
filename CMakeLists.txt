@@ -99,6 +99,12 @@ list(APPEND RTXMG_SHADERS_IGNORED_INCLUDES
     "rtxmg/utils/buffer.h"
 )
 
+# TBB needed for C++17 parallel algorithms on gcc
+if ( CMAKE_CXX_COMPILER_ID STREQUAL "GNU" )
+    find_package( TBB REQUIRED )
+endif()
+
+
 add_subdirectory(extern/donut)
 add_subdirectory(extern/osd_lite EXCLUDE_FROM_ALL)
 add_subdirectory(rtxmg)
