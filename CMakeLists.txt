@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.10)
 
 project(rtxmg LANGUAGES C CXX VERSION 1.0.1)
 
+if(WIN32)
+    message(STATUS "Found Windows ${CMAKE_SYSTEM_VERSION} - SDK: ${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
+endif()    
+
 set(CMAKE_CONFIGURATION_TYPES "Debug;Release;RelWithDebInfo;ReleaseAsan" CACHE STRING "Configurations" FORCE)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
