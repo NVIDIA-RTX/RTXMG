@@ -12,6 +12,14 @@
       }
     },
     {
+      "name": "vs2022-arm64",
+      "displayName": "Visual Studio 2022 ARM64",
+      "description": "Windows on Arm. Cross-compiles from an x64 host (needs the MSVC ARM64 build tools) or builds natively on ARM64. Outputs to bin_arm64/.",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "ARM64",
+      "binaryDir": "${sourceDir}/build_arm64"
+    },
+    {
       "name": "clangd",
       "displayName": "Clangd (compile_commands.json for IDE tooling, Windows/MSVC)",
       "description": "Ninja+MSVC build used only to generate compile_commands.json for clangd. Not for building. Run from a VS 2022 x64 developer prompt.",
@@ -41,6 +49,18 @@
       "name": "debug",
       "displayName": "Debug",
       "configurePreset": "vs2022",
+      "configuration": "Debug"
+    },
+    {
+      "name": "relwithdebinfo-arm64",
+      "displayName": "RelWithDebInfo ARM64",
+      "configurePreset": "vs2022-arm64",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "debug-arm64",
+      "displayName": "Debug ARM64",
+      "configurePreset": "vs2022-arm64",
       "configuration": "Debug"
     }
   ]

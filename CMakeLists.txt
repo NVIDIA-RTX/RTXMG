@@ -1,12 +1,17 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 4.1)
 
-project(rtxmg LANGUAGES C CXX VERSION 2.0.0)
+project(rtxmg LANGUAGES C CXX VERSION 2.1.0)
 
 set(CMAKE_CONFIGURATION_TYPES "Debug;Release;RelWithDebInfo;ReleaseAsan" CACHE STRING "Configurations" FORCE)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_FIND_ROOT_PATH ${CMAKE_SOURCE_DIR}/extern)
+
+# CMAKE_SYSTEM_PROCESSOR is the host in a Visual Studio cross build; the compiler knows the target.
+if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "^(ARM64|arm64|aarch64)$")
+    set(RTXMG_ARM64 ON)
+endif()
 
 ####################################
 # Static analysis
@@ -18,7 +23,13 @@ set_property( GLOBAL PROPERTY VS_USER_PROPS "rtxmg_static_analysis.props")
 ####################################
 # ASAN
 ####################################
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin")
+# Also the install folder, so one package can carry both architectures next to a shared assets/.
+if(RTXMG_ARM64)
+    set(RTXMG_BIN_DIR "bin_arm64")
+else()
+    set(RTXMG_BIN_DIR "bin")
+endif()
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/${RTXMG_BIN_DIR}")
 foreach(CONFIG_TYPE DEBUG RELEASE MINSIZEREL RELWITHDEBINFO RELEASEASAN)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${CONFIG_TYPE} "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 endforeach()
@@ -51,11 +62,9 @@ set(SHADERMAKE_FIND_DXC ON CACHE BOOL "" FORCE)
 # Streamline
 ####################################
 set(DONUT_WITH_STREAMLINE ON CACHE BOOL "" FORCE)
-set(DONUT_STREAMLINE_FETCH_URL "https://github.com/NVIDIA-RTX/Streamline/releases/download/v2.8.0/streamline-sdk-v2.8.0.zip" CACHE STRING "")
-set(DONUT_STREAMLINE_FETCH_SHA256 "313669f8cf886f823ea0518a50712efa5e2e8623689ed2a6bd0d9353e475bc47" CACHE STRING "")
 set(STREAMLINE_FEATURE_DLSS_SR ON CACHE BOOL "" FORCE)
 set(STREAMLINE_FEATURE_DLSS_RR ON CACHE BOOL "" FORCE)
-set(STREAMLINE_INSTALL_DIR "bin" CACHE STRING "" FORCE)
+set(STREAMLINE_INSTALL_DIR "${RTXMG_BIN_DIR}" CACHE STRING "" FORCE)
 
 ####################################
 # NVAPI
@@ -139,6 +148,9 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(mimalloc)
 set_target_properties(mimalloc-static PROPERTIES FOLDER "extern")
+# mimalloc installs its headers, .lib and cmake/pkgconfig files, which would
+# otherwise land in the package as include/ and lib/.
+set_property(DIRECTORY "${mimalloc_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL YES)
 
 # The C++ and the HLSL halves of the ring have to agree, and the shader compile
 # takes its defines from the ShaderMake option string, not from CMake targets.

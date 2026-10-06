@@ -107,7 +107,7 @@ the UI panels, the Inspector, the Profiler, and the VRAM Budget window; see
 To Run:
 - Windows 10
 - NVIDIA RTX GPU (10 GB VRAM or greater)
-- GeForce Game Ready Driver 570 or later
+- GeForce Game Ready Driver 570 or later (R615 or later on Windows on Arm64)
 - DirectX Raytracing 1.1 API or later
 
 The Cluster LOD path sizes its pools from fixed budgets: 2048 MB of streamed geometry
@@ -117,7 +117,7 @@ any of them trades detail for VRAM rather than failing to load. See
 [ClusterLOD.md — Streaming budgets](docs/ClusterLOD.md#streaming-budgets).
 
 To Build:
-- CMake v3.31+
+- CMake v4.1+
 - Windows 10 SDK 10.0.20348.0 or later
 - MSVC Compiler 19.43.34810 (Visual Studio 2022 17.13) or later
 - For Windows: DirectX 12 AgilitySDK will be fetched automatically
@@ -129,6 +129,7 @@ To Build:
 | -	                    | -                                                                    |
 | /bin                  | default CMake folder for binaries and compiled shaders               |
 | /build                | default CMake folder for build files                                 |
+| /bin_arm64, /build_arm64 | the same, for Windows on Arm64 builds                             |
 | /extern               | external submoduled libraries and SDKs, including osd_lite and donut |
 | /assets               | models, textures, scene files (git submodule)                        |
 | /rtxmg                | **RTX Mega Geometry core**                                           |
@@ -163,6 +164,25 @@ back-end are supported there; pass `-vk` to run on Vulkan.
 
 4. Select and run the `rtxmg_demo` project. Binaries get built to the `bin` folder. 
    Media assets are loaded from the `assets` folder.
+
+### Windows on Arm64
+
+Configure with the `vs2022-arm64` preset, which builds into `build_arm64` and writes
+binaries to `bin_arm64`:
+
+```
+cmake --preset vs2022-arm64
+cmake --build --preset relwithdebinfo-arm64
+```
+
+This works natively on an Arm64 machine or as a cross-compile from x64. Either way it
+needs the *MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools* component from the
+Visual Studio Installer.
+
+To package both architectures in one zip, configure the x64 build with
+`-DRTXMG_PACKAGE_ARM64_BUILD_DIR=<path to build_arm64>`, build both, and run
+`cpack -C RelWithDebInfo` in `build`. The zip holds `bin` and `bin_arm64` next to one
+shared `assets` folder, and the `run_*.bat` scripts pick the right one for the machine.
 
 
  ## User Interface

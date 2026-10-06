@@ -83,39 +83,56 @@ endif()
 # Installation & packaging
 #
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
-    set(CMAKE_INSTALL_PREFIX "${CMAKE_SOURCE_DIR}/_install" CACHE PATH "Installation directory" FORCE)
+    if(RTXMG_ARM64)
+        set(CMAKE_INSTALL_PREFIX "${CMAKE_SOURCE_DIR}/_install_arm64" CACHE PATH "Installation directory" FORCE)
+    else()
+        set(CMAKE_INSTALL_PREFIX "${CMAKE_SOURCE_DIR}/_install" CACHE PATH "Installation directory" FORCE)
+    endif()
 endif()
 
-install(TARGETS ${app} DESTINATION "bin")
+install(TARGETS ${app} DESTINATION "${RTXMG_BIN_DIR}")
 
-install(DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders" DESTINATION "bin" )
+install(DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders" DESTINATION "${RTXMG_BIN_DIR}" )
 
 if(WIN32)
-    install(FILES $<TARGET_RUNTIME_DLLS:${app}> DESTINATION "bin")
+    install(FILES $<TARGET_RUNTIME_DLLS:${app}> DESTINATION "${RTXMG_BIN_DIR}")
 
-    # generate some shortcuts to run various scenes; a relative -mf resolves under assets/
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/run_rtxmg.bat" "start \"\" bin/rtxmg_demo.exe")
-    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/run_rtxmg.bat" DESTINATION ".")
+    # Donut marks Streamline EXCLUDE_FROM_ALL, which drops its own install rule.
+    if(DONUT_WITH_STREAMLINE)
+        FetchContent_GetProperties(streamline)
+        get_directory_property(_sl_dlls DIRECTORY "${streamline_SOURCE_DIR}" DEFINITION STREAMLINE_DLLS)
+        get_directory_property(_sl_jsons DIRECTORY "${streamline_SOURCE_DIR}" DEFINITION STREAMLINE_JSONS)
+        install(FILES ${_sl_dlls} ${_sl_jsons} DESTINATION "${RTXMG_BIN_DIR}")
+    endif()
 
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/run_abeautifulgame.bat" "start \"\" bin/rtxmg_demo.exe -mf cluster_lod/ABeautifulGame/glTF/ABeautifulGame.gltf")
-    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/run_abeautifulgame.bat" DESTINATION ".")
+    # Scene shortcuts shared by both architectures; a relative -mf resolves under assets/
+    function(rtxmg_run_script name RUN_ARGS)
+        file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${name}.bat" NEWLINE_STYLE CRLF @ONLY CONTENT [=[
+@echo off
+set BIN=bin
+if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" if exist "%~dp0bin_arm64\rtxmg_demo.exe" set BIN=bin_arm64
+start "" "%~dp0%BIN%\rtxmg_demo.exe" @RUN_ARGS@
+]=])
+        install(FILES "${CMAKE_CURRENT_BINARY_DIR}/${name}.bat" DESTINATION ".")
+    endfunction()
 
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/run_amy_abeautifulgame.bat" "start \"\" bin/rtxmg_demo.exe -mf subdivision/amy_abeautifulgame.scene.json")
-    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/run_amy_abeautifulgame.bat" DESTINATION ".")
+    rtxmg_run_script(run_rtxmg "")
+    rtxmg_run_script(run_abeautifulgame "-mf cluster_lod/ABeautifulGame/glTF/ABeautifulGame.gltf")
+    rtxmg_run_script(run_amy_abeautifulgame "-mf subdivision/amy_abeautifulgame.scene.json")
+    rtxmg_run_script(run_amy_kitchenset "-mf subdivision/amy_kitchenset.scene.json")
+    rtxmg_run_script(run_barbarian "-mf subdivision/barbarian_pt.scene.json")
 
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/run_amy_kitchenset.bat" "start \"\" bin/rtxmg_demo.exe -mf subdivision/amy_kitchenset.scene.json")
-    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/run_amy_kitchenset.bat" DESTINATION ".")
-
-    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/run_barbarian.bat" "start \"\" bin/rtxmg_demo.exe -mf subdivision/barbarian_pt.scene.json")
-    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/run_barbarian.bat" DESTINATION ".")
-
-    set(_os "win64")
+    if (RTXMG_ARM64)
+        set(_os "win-arm64")
+    else()
+        set(_os "win64")
+    endif()
 elseif (UNIX AND NOT APPLE)
     set(_os "linux64")
 endif()
 
 if(DONUT_D3D_AGILITY_SDK_ENABLED)
-    install(DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/D3D12" DESTINATION "bin" )
+    install(DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/D3D12" DESTINATION "${RTXMG_BIN_DIR}" )
 endif()
 
 if(IS_DIRECTORY "${PROJECT_SOURCE_DIR}/assets")
@@ -125,6 +142,14 @@ if(IS_DIRECTORY "${PROJECT_SOURCE_DIR}/assets")
         PATTERN ".git*" EXCLUDE
         REGEX "\\.subdcache$" EXCLUDE
         REGEX "nvsngeo" EXCLUDE)
+endif()
+
+set(RTXMG_PACKAGE_ARM64_BUILD_DIR "" CACHE PATH "Arm64 build dir whose install is packaged alongside this x64 one")
+if(RTXMG_PACKAGE_ARM64_BUILD_DIR AND NOT RTXMG_ARM64)
+    set(CPACK_INSTALL_CMAKE_PROJECTS
+        "${CMAKE_BINARY_DIR};${CMAKE_PROJECT_NAME};ALL;/"
+        "${RTXMG_PACKAGE_ARM64_BUILD_DIR};${CMAKE_PROJECT_NAME};ALL;/")
+    set(_os "win-x64-arm64")
 endif()
 
 set(CPACK_GENERATOR "ZIP")

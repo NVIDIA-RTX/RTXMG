@@ -1755,54 +1755,42 @@ void UserInterface::BuildDenoiserSection()
                 if (uiData.dlssMode != StreamlineInterface::DLSSMode::eUltraQuality &&
                     uiData.dlssMode != StreamlineInterface::DLSSMode::eOff)
                 {
-                    std::array<const char*, 7> kDlssPresetNames = {
-                        "Default",
-                        "Preset A",
-                        "Preset B",
-                        "Preset C",
-                        "Preset D",
-                        "Preset E",
-                        "Preset F"
+                    using SrPreset = StreamlineInterface::DLSSPreset;
+                    using RrPreset = StreamlineInterface::DLSSRRPreset;
+                    static constexpr std::pair<const char*, SrPreset> kDlssPresets[] = {
+                        { "Default",  SrPreset::eDefault },
+                        { "Preset J", SrPreset::ePresetJ },
+                        { "Preset K", SrPreset::ePresetK },
+                    };
+                    static constexpr std::pair<const char*, RrPreset> kDlssRRPresets[] = {
+                        { "Default",  RrPreset::eDefault },
+                        { "Preset D", RrPreset::ePresetD },
+                        { "Preset E", RrPreset::ePresetE },
+                        { "Preset F", RrPreset::ePresetF },
                     };
 
-                    std::array<const char*, 7> kDlssRRPresetNames = {
-                        "Default",
-                        "Preset A",
-                        "Preset B",
-                        "Preset C",
-                        "Preset D",
-                        "Preset E",
-                        "Preset G"
+                    auto presetCombo = [](const char* label, const auto& presets, auto& current)
+                    {
+                        const char* preview = presets[0].first;
+                        for (const auto& [name, value] : presets)
+                            if (value == current) preview = name;
+
+                        if (ImGui::BeginCombo(label, preview))
+                        {
+                            for (const auto& [name, value] : presets)
+                            {
+                                bool isSelected = value == current;
+                                if (ImGui::Selectable(name, isSelected)) current = value;
+                                if (isSelected) ImGui::SetItemDefaultFocus();
+                            }
+                            ImGui::EndCombo();
+                        }
                     };
 
                     if (denoiserMode == DenoiserMode::DlssSr)
-                    {
-                        if (ImGui::BeginCombo("DLSS SR Preset", kDlssPresetNames[(int)uiData.dlssPreset]))
-                        {
-                            for (int i = 0; i < kDlssPresetNames.size(); ++i)
-                            {
-                                bool isSelected = i == static_cast<int>(uiData.dlssPreset);
-
-                                if (ImGui::Selectable(kDlssPresetNames[i], isSelected)) uiData.dlssPreset = (StreamlineInterface::DLSSPreset)i;
-                                if (isSelected) ImGui::SetItemDefaultFocus();
-                            }
-                            ImGui::EndCombo();
-                        }
-                    }
+                        presetCombo("DLSS SR Preset", kDlssPresets, uiData.dlssPreset);
                     else
-                    {
-                        if (ImGui::BeginCombo("DLSS RR Preset", kDlssRRPresetNames[(int)uiData.dlssRRPreset]))
-                        {
-                            for (int i = 0; i < kDlssRRPresetNames.size(); ++i)
-                            {
-                                bool isSelected = i == static_cast<int>(uiData.dlssRRPreset);
-
-                                if (ImGui::Selectable(kDlssRRPresetNames[i], isSelected)) uiData.dlssRRPreset = (StreamlineInterface::DLSSRRPreset)i;
-                                if (isSelected) ImGui::SetItemDefaultFocus();
-                            }
-                            ImGui::EndCombo();
-                        }
-                    }
+                        presetCombo("DLSS RR Preset", kDlssRRPresets, uiData.dlssRRPreset);
                 }
 
                 ImGui::Checkbox("Overide LOD Bias", &uiData.dlssUseLodBiasOverride);

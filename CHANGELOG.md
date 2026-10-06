@@ -1,5 +1,24 @@
 # RTX Mega Geometry SDK Change Log
 
+## 2.1.0
+
+Platform
+
+* Build for Windows on Arm64 via the `vs2022-arm64` preset, either cross-compiled from
+  an x64 host or natively; binaries go to `bin_arm64` and installs to `_install_arm64`
+* The release zip carries both architectures, `bin` and `bin_arm64`, next to one shared
+  `assets` folder; the `run_*.bat` scripts pick the one that matches the machine
+* Update Streamline to 2.14.1, NVAPI to R615 and Nsight Aftermath to 2026.3, the first
+  releases that ship Arm64 binaries
+* Update DXC to 1.9.2609; Arm64 build machines use the native Arm64 shader compilers
+* Require CMake 4.1 or later
+* Show the CPU architecture in the window title, e.g. `(D3D12 arm64)`
+
+Bug Fixes
+
+* The DLSS preset menus only offer presets Streamline still supports; the RR entry
+  labelled Preset G selected Preset F
+
 ## 2.0.0
 
 Adds a second geometry path: **Cluster LOD**. Pre-baked triangle clusters are selected

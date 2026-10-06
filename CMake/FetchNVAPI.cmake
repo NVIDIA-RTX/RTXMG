@@ -12,7 +12,7 @@
 include(FetchContent)
 
 set(NVAPI_FETCH_URL "https://github.com/NVIDIA/nvapi.git" CACHE STRING "Url to nvapi git repo to fetch")
-set(NVAPI_FETCH_TAG "ce6d2a183f9559f717e82b80333966d19edb9c8c" CACHE STRING "Tag of nvapi git repo")
+set(NVAPI_FETCH_TAG "87dca625e83fd89a983e19b904e5f3a580da90d2" CACHE STRING "Tag of nvapi git repo")
 set(NVAPI_FETCH_DIR "" CACHE STRING "Directory to fetch streamline to, empty uses build directory default")
 
 include(FetchContent)

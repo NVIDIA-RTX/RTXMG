@@ -55,11 +55,19 @@ static LONG WINAPI UnhandledExceptionHandler(EXCEPTION_POINTERS* pExceptionInfo)
     fprintf(stderr, "Exception Address: %p\n", pRecord->ExceptionAddress);
 
     STACKFRAME64 frame = {};
+#if defined(_M_ARM64)
+    const DWORD machineType = IMAGE_FILE_MACHINE_ARM64;
+    frame.AddrPC.Offset    = context.Pc;
+    frame.AddrFrame.Offset = context.Fp;
+    frame.AddrStack.Offset = context.Sp;
+#else
+    const DWORD machineType = IMAGE_FILE_MACHINE_AMD64;
     frame.AddrPC.Offset    = context.Rip;
-    frame.AddrPC.Mode      = AddrModeFlat;
     frame.AddrFrame.Offset = context.Rbp;
-    frame.AddrFrame.Mode   = AddrModeFlat;
     frame.AddrStack.Offset = context.Rsp;
+#endif
+    frame.AddrPC.Mode      = AddrModeFlat;
+    frame.AddrFrame.Mode   = AddrModeFlat;
     frame.AddrStack.Mode   = AddrModeFlat;
 
     char symBuf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME];
@@ -75,7 +83,7 @@ static LONG WINAPI UnhandledExceptionHandler(EXCEPTION_POINTERS* pExceptionInfo)
     HANDLE hThread = GetCurrentThread();
     for (int i = 0; i < 64; ++i)
     {
-        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, hProcess, hThread, &frame,
+        if (!StackWalk64(machineType, hProcess, hThread, &frame,
                 &context, nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr)
             || frame.AddrPC.Offset == 0)
             break;
@@ -177,7 +185,12 @@ int main(int argc, const char** argv)
 
     app::DeviceManager* deviceManager = app::DeviceManager::Create(api);
 
-    std::string title = "RTX Mega Geometry " RTXMG_VERSION + std::string(api == nvrhi::GraphicsAPI::D3D12 ? " (D3D12)" : " (VULKAN)");
+#if defined(_M_ARM64) || defined(__aarch64__)
+    const char* arch = "arm64";
+#else
+    const char* arch = "x64";
+#endif
+    std::string title = "RTX Mega Geometry " RTXMG_VERSION + std::string(api == nvrhi::GraphicsAPI::D3D12 ? " (D3D12 " : " (VULKAN ") + arch + ")";
 
     try 
     {

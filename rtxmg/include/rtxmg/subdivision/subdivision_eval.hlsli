@@ -96,7 +96,7 @@ struct SubdivisionEvaluatorHLSL
     
     SubdivisionPlanContext GetPlan()
     {
-        SubdivisionPlanContext context = (SubdivisionPlanContext)0;
+        SubdivisionPlanContext context;
         context.m_data = m_plans[GetSurfaceDesc().GetSubdivisionPlanIndex()];
         context.m_subpatchTrees = m_subpatchTrees;
         context.m_patchPoints = m_vertexPatchPointIndices;

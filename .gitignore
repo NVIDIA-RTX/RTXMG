@@ -1,8 +1,10 @@
 *.*~
 scenes
 bin/
+bin_arm64/
 _build*/
 _install/
+_install_arm64/
 build*/
 .vscode/
 .claude/
