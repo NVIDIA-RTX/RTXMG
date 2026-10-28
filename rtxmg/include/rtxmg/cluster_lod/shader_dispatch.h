@@ -26,6 +26,7 @@ namespace shaderio {
 
 // Lanes per wave.  Not overridable: the ballot code packs lane bits into a
 // single uint32, so a wider wave needs source changes, not a new value.
+// Must match the [WaveSize] in rtxmg/utils/wave_size.hlsli.
 static const uint32_t kWaveSize = 32;
 
 // traversal_setup.hlsl mode IDs.  Shared between the C++ caller (which writes

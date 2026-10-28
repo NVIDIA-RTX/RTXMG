@@ -86,6 +86,7 @@ public:
     // Async-read one frame behind: valid after the second Update.
     const shaderio::SceneBuildingCounters& GetCounters() const { return m_counters; }
     uint64_t GetBlasActualBytes() const { return m_blasActualBytes; }
+    uint64_t GetBlasBufferBytes() const { return m_blasPass.GetBlasBufferBytes(); }
 
     // Traversal + BLAS-build tables, excluding the BLAS storage itself.
     uint64_t GetMetadataBytes() const

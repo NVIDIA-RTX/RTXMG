@@ -68,8 +68,12 @@ if(DONUT_D3D_AGILITY_SDK_ENABLED)
     add_custom_command(TARGET ${app} POST_BUILD
         COMMAND 
             ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${app}>/D3D12/"
-        COMMAND 
+        COMMAND
             ${CMAKE_COMMAND} -E copy_if_different ${DONUT_D3D_AGILITY_SDK_CORE_DLL} "$<TARGET_FILE_DIR:${app}>/D3D12/"
+        # The debug layer has to come from the same SDK as the core runtime, or --debug
+        # silently gets the OS one (or none) instead.
+        COMMAND
+            ${CMAKE_COMMAND} -E copy_if_different ${DONUT_D3D_AGILITY_SDK_LAYERS_DLL} "$<TARGET_FILE_DIR:${app}>/D3D12/"
     )
 endif()
 
@@ -96,14 +100,6 @@ install(DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders" DESTINATION "${RTX
 
 if(WIN32)
     install(FILES $<TARGET_RUNTIME_DLLS:${app}> DESTINATION "${RTXMG_BIN_DIR}")
-
-    # Donut marks Streamline EXCLUDE_FROM_ALL, which drops its own install rule.
-    if(DONUT_WITH_STREAMLINE)
-        FetchContent_GetProperties(streamline)
-        get_directory_property(_sl_dlls DIRECTORY "${streamline_SOURCE_DIR}" DEFINITION STREAMLINE_DLLS)
-        get_directory_property(_sl_jsons DIRECTORY "${streamline_SOURCE_DIR}" DEFINITION STREAMLINE_JSONS)
-        install(FILES ${_sl_dlls} ${_sl_jsons} DESTINATION "${RTXMG_BIN_DIR}")
-    endif()
 
     # Scene shortcuts shared by both architectures; a relative -mf resolves under assets/
     function(rtxmg_run_script name RUN_ARGS)

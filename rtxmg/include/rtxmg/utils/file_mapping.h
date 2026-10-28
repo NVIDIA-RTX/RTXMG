@@ -10,7 +10,7 @@
  * its affiliates is strictly prohibited.
  */
 
-// Windows read-only memory-mapped file wrapper.
+// Read-only memory-mapped file wrapper.
 
 #pragma once
 

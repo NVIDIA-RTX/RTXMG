@@ -150,7 +150,7 @@ bool IntersectHiz(float4 clipMin, float4 clipMax,
 
     float2 uv = (sMin + sMax) * 0.5f * invTileSize * hizInvSize;
     // Gather + max over 4 texels in case the footprint straddles a tile boundary.
-    float4 z4   = hizFar[level].Gather(hizSampler, uv, 0);
+    float4 z4   = hizFar[NonUniformResourceIndex(level)].Gather(hizSampler, uv, 0);
     float  zFar = max(max(z4.x, z4.y), max(z4.z, z4.w));
 
     // Visible if the nearest part of the AABB is at/in front of the farthest

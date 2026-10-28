@@ -294,6 +294,13 @@ namespace stats
         uint64_t budgetBytes     = 0;  // --texture-budget-mb (0 = unlimited)
         uint64_t loadedBytes     = 0;  // resident GPU bytes, any format
         uint64_t loadedOtherBytes = 0; // of loadedBytes, the non-KTX2 part
+        // What the resident set occupies in VRAM: loadedBytes plus page and mip-tail
+        // padding.  Everything else here stays packed, the unit the budget solves in.
+        uint64_t vramBytes       = 0;
+
+        // Padding the allocator adds on top of the packed sizes; carried onto
+        // budget projections so they compare with the VRAM window's allocation.
+        uint64_t VramPaddingBytes() const { return vramBytes > loadedBytes ? vramBytes - loadedBytes : 0; }
 
         // Full-resolution GPU footprint, the residency bar's denominator.  Only the
         // KTX2 half is known before decoding; other formats never drop mips, so a
@@ -392,13 +399,13 @@ namespace stats
     // Budget window plots it.  Refreshed once a frame from the samplers above, so
     // it is a view of them rather than a second source of truth.
     //
-    // Deliberately NOT a process total: DLSS/NGX, nvrhi's own descriptor heaps and
-    // the driver allocate outside anything the sample can see.  RTXMGDemoApp::
-    // QueryDriverVram supplies that, and the difference is the unaccounted gap.
+    // Deliberately NOT a process total: nvrhi's descriptor heaps and the driver
+    // allocate outside anything the sample can see.  RTXMGDemoApp::QueryDriverVram
+    // supplies that, and the difference is the unaccounted gap.
     struct VramBreakdown
     {
         uint64_t textures      = 0;  // material textures resident on the GPU
-        uint64_t envmap        = 0;
+        uint64_t envmap        = 0;  // envmap texture + importance-sampling tables
         // Cluster-LoD pools, as VRAM actually committed: the geometry and
         // cached-BLAS pools grow in blocks, so these are block multiples rather
         // than the sub-allocated totals the Memory tab reports.
@@ -412,6 +419,9 @@ namespace stats
         uint64_t tessVertices  = 0;  // cluster_tess vertex + normals buffers
         uint64_t tessClas      = 0;
         uint64_t tessClusterData = 0;
+        // Subd meshes, keyframes, poses, topology maps and the tessellator's
+        // per-instance / per-patch buffers.
+        uint64_t tessSurfaces  = 0;
 
         // Occupancy inside the allocation above, for the pools that track it —
         // the same used/allocated pairs the profiler's Memory tab plots.  Never
@@ -421,7 +431,13 @@ namespace stats
         uint64_t tessVerticesUsed    = 0;
         uint64_t tessClasUsed        = 0;
         uint64_t tessClusterDataUsed = 0;
-        uint64_t blas          = 0;  // BLAS + its scratch, both paths
+        uint64_t blasUsed            = 0;
+        // BLAS storage of both paths at its allocated size, plus the TLAS and
+        // its instance descs.
+        uint64_t blas          = 0;
+        // nvrhi's per-command-list AS build scratch pools; they never shrink.
+        uint64_t asScratch     = 0;
+        uint64_t dlss          = 0;  // Streamline's estimate for DLSS / DLSS-RR
         uint64_t renderTargets = 0;  // output textures, NRD set, HiZ chain, z-prepass
 
         // Driver-reported, when the API exposes it (D3D12 always, VK with
@@ -434,8 +450,8 @@ namespace stats
         uint64_t Accounted() const
         {
             return textures + envmap + clodGeometry + clodClas + clodCachedBlas
-                 + clodMetadata + tessVertices + tessClas + tessClusterData
-                 + blas + renderTargets;
+                 + clodMetadata + tessVertices + tessClas + tessClusterData + tessSurfaces
+                 + blas + asScratch + dlss + renderTargets;
         }
         // Nonzero only when the driver reading is available and above the stack.
         uint64_t Unaccounted() const

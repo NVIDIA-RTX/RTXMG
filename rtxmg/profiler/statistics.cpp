@@ -323,7 +323,7 @@ namespace stats {
             else if constexpr (std::is_same_v<T, float>)
                 ImGui::Text("%.1f", value);
             else if constexpr (std::is_integral_v<T>)
-                ImGui::Text("%d", int64_t(value));
+                ImGui::Text("%lld", (long long)value);
             if (tooltip && ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", tooltip);
         };
@@ -1256,7 +1256,7 @@ namespace stats {
             else if constexpr (std::is_same_v<T, float>)
                 ImGui::Text("%.1f", value);
             else if constexpr (std::is_integral_v<T>)
-                ImGui::Text("%d", int64_t(value));
+                ImGui::Text("%lld", (long long)value);
             if (tooltip && ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", tooltip);
         };

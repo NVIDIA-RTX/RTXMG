@@ -210,13 +210,6 @@ private:
     // from there; only the streaming-only extras live here.
     struct PersistentGeometry : BaseGeometry
     {
-        RTXMGBuffer<uint8_t>            lowDetailGroupsData;
-        donut::engine::DescriptorHandle lowDetailGroupsDataSRVHandle;
-        // Per-triangle CLAS geometry-index/flags buffer for any mixed
-        // (ClusterState *Mixed) clusters in this geometry's low-detail
-        // residency. Empty when none of the low-detail clusters need
-        // mixed-geometry-index encoding (the common case).
-        RTXMGBuffer<nvrhi::rt::cluster::GeometryIndexAndFlags> lowDetailClasGeometryIndices;
         uint32_t                        lodLevelsCount                                = 0;
         uint32_t                        lodLoadedGroupsCount[shaderio::kMaxLodLevels] = {};
         uint32_t                        lodGroupsCount[shaderio::kMaxLodLevels]       = {};
@@ -267,7 +260,12 @@ private:
     uint32_t        m_maxClusterVertices  = 0;
     bool            m_requiresClas        = false;
     bool            m_hasAlphaMask        = false;
+    // LoD-metadata buffers + low-detail blobs, measured by InitGeometries.
     size_t          m_persistentGeometrySize = 0;
+    size_t          GetPersistentDataBytes() const
+    {
+        return m_persistentGeometrySize + m_lowDetailClasGeometryIndices.GetVramBytes();
+    }
     size_t          m_operationsSize      = 0;
     size_t          m_clasOperationsSize  = 0;
     size_t          m_blasSize            = 0;
@@ -289,6 +287,14 @@ private:
 
     // Persistent scene data.
     std::vector<PersistentGeometry> m_persistentGeometries;
+
+    // Every geometry's low-detail group blob, packed at 16-byte offsets behind
+    // one raw SRV; each resident low-detail group addresses its blob by offset.
+    RTXMGBuffer<uint8_t>            m_lowDetailGroupsData;
+    donut::engine::DescriptorHandle m_lowDetailGroupsDataSRVHandle;
+    // Per-triangle CLAS geometry-index/flags entries for the low-detail
+    // clusters that need mixed-geometry-index encoding; empty when none do.
+    RTXMGBuffer<nvrhi::rt::cluster::GeometryIndexAndFlags> m_lowDetailClasGeometryIndices;
 
     // Per-geometry data (groupInfos, lodLevels, groupData) cached at init.  The
     // spans inside GeometryView reference scene-owned storage; the caller
@@ -521,7 +527,7 @@ private:
     // arg per cluster, plus the sizing the CLAS/BLAS builds need back.
     struct LowDetailClasArgs
     {
-        std::vector<nvrhi::rt::cluster::IndirectTriangleClasArgs> clasArgs;
+        std::vector<nvrhi::rt::cluster::nv::IndirectTriangleClasArgs> clasArgs;
         std::vector<nvrhi::rt::cluster::IndirectArgs>             blasArgs;
         uint32_t groupsCount           = 0;
         uint32_t clustersCount         = 0;

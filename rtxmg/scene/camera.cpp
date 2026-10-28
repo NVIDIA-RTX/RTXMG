@@ -50,7 +50,7 @@ void Camera::Roll(float speed)
     auto const& basis = GetBasis();
     float3 u = normalize(basis[0]);
     float3 v = normalize(basis[1]);
-    m_up = u * cos(radians(90.0f + speed)) + v * sin(radians(90.0f + speed));
+    m_up = u * std::cos(radians(90.0f + speed)) + v * std::sin(radians(90.0f + speed));
     m_changed = true;
 }
 
@@ -176,27 +176,59 @@ void Camera::SetFar(float far)
     m_changed = true;
 }
 
-static inline std::istream& operator>>(std::istream& is, float3& v)
+// "[x,y,z]" (commas or whitespace between components) starting at `pos`.
+static bool ParseVector(std::string const& s, size_t& pos, float3& v)
 {
-    char st;
-    is >> st >> v.x >> st >> v.y >> st >> v.z >> st;
-    return is;
+    const size_t open = s.find_first_not_of(" \t\r\n", pos);
+    if (open == std::string::npos || s[open] != '[')
+        return false;
+    const size_t close = s.find(']', open);
+    if (close == std::string::npos)
+        return false;
+
+    std::string inner = s.substr(open + 1, close - open - 1);
+    std::replace(inner.begin(), inner.end(), ',', ' ');
+    std::istringstream is(inner);
+    if (!(is >> v.x >> v.y >> v.z) || !(is >> std::ws).eof())
+        return false;
+    pos = close + 1;
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
 }
 
-void Camera::Set(std::string const& camc_string)
+bool Camera::Set(std::string const& camc_string)
 {
-    std::istringstream istr(camc_string);
-    istr >> m_eye;
-    istr >> m_lookat;
-    istr >> m_up;
-    istr >> m_fovY;
+    float3 eye, lookat, up;
+    size_t pos = 0;
+    if (!ParseVector(camc_string, pos, eye) || !ParseVector(camc_string, pos, lookat) ||
+        !ParseVector(camc_string, pos, up))
+        return false;
+
+    std::istringstream is(camc_string.substr(pos));
+    float fovY = 0.f;
+    if (!(is >> fovY) || !(is >> std::ws).eof())
+        return false;
+    if (!(fovY > 0.f && fovY < 180.f) || length(lookat - eye) <= 0.f || length(up) <= 0.f)
+        return false;
+
+    m_eye     = eye;
+    m_lookat  = lookat;
+    m_up      = up;
+    m_fovY    = fovY;
     m_changed = true;
+    return true;
 }
 
 void Camera::Print() const
 {
-    printf("[%g,%g,%g][%g,%g,%g][%g,%g,%g]%g\n", m_eye.x, m_eye.y, m_eye.z,
+    printf("%s\n", ToString().c_str());
+}
+
+std::string Camera::ToString() const
+{
+    char buf[256];
+    snprintf(buf, sizeof(buf), "[%g,%g,%g][%g,%g,%g][%g,%g,%g]%g", m_eye.x, m_eye.y, m_eye.z,
         m_lookat.x, m_lookat.y, m_lookat.z, m_up.x, m_up.y, m_up.z, m_fovY);
+    return buf;
 }
 
 float4x4 Camera::GetViewMatrix() const

@@ -10,6 +10,7 @@
  * its affiliates is strictly prohibited.
  */
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -17,6 +18,14 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include <donut/core/log.h>
 
@@ -52,6 +61,8 @@ FileReadMapping& FileReadMapping::operator=(FileReadMapping&& o) noexcept
     }
     return *this;
 }
+
+#ifdef _WIN32
 
 bool FileReadMapping::Open(const std::filesystem::path& path)
 {
@@ -125,5 +136,53 @@ void FileReadMapping::Close()
     }
     m_size = 0;
 }
+
+#else
+
+// The mapping outlives the descriptor, so no OS handle is kept open.
+bool FileReadMapping::Open(const std::filesystem::path& path)
+{
+    Close();
+
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        donut::log::error("FileReadMapping: failed to open '%s' (%s)",
+                          path.string().c_str(), strerror(errno));
+        return false;
+    }
+
+    struct stat st{};
+    if (fstat(fd, &st) != 0 || st.st_size == 0)
+    {
+        close(fd);
+        return false;
+    }
+
+    void* view = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (view == MAP_FAILED)
+    {
+        donut::log::error("FileReadMapping: mmap failed for '%s' (%s)",
+                          path.string().c_str(), strerror(errno));
+        return false;
+    }
+
+    m_data = view;
+    m_size = size_t(st.st_size);
+    return true;
+}
+
+void FileReadMapping::Close()
+{
+    if (m_data)
+    {
+        munmap(m_data, m_size);
+        m_data = nullptr;
+    }
+    m_size = 0;
+}
+
+#endif
 
 } // namespace rtxmg

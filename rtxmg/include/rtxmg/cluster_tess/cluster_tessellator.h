@@ -55,6 +55,11 @@ struct TemplateGridDesc
 struct TemplateGrids
 {
     typedef uint8_t IndexType;
+    static_assert(sizeof(IndexType) == 1 || sizeof(IndexType) == 2 || sizeof(IndexType) == 4);
+    static constexpr nvrhi::rt::cluster::OperationIndexFormat kIndexFormat =
+        sizeof(IndexType) == 1 ? nvrhi::rt::cluster::OperationIndexFormat::IndexFormat8bit :
+        sizeof(IndexType) == 2 ? nvrhi::rt::cluster::OperationIndexFormat::IndexFormat16bit :
+                                 nvrhi::rt::cluster::OperationIndexFormat::IndexFormat32bit;
 
     std::vector<TemplateGridDesc> descs;
     std::vector<IndexType> indices;
@@ -199,6 +204,10 @@ public:
     void BuildAccel(const RTXMGScene& scene, const TessellatorConfig& config,
         ClusterTessAccels& accels, ClusterTessStatistics& stats, uint32_t frameIndex, nvrhi::ICommandList* commandList);
 
+    // Device bytes outside the ClusterTessStatistics buffers: per-instance
+    // indirect args, per-patch grid samplers, cluster templates and counters.
+    uint64_t GetWorkingBufferBytes(const ClusterTessAccels& accels) const;
+
 #if ENABLE_SHADER_DEBUG
     RTXMGBuffer<ShaderDebugElement>& GetDebugBuffer() { return m_debugBuffer; }
 #endif
@@ -228,6 +237,7 @@ protected:
         nvrhi::ICommandList* commandList);
     void CopyClusterOffset(uint32_t instanceIndex, ClusterTessDispatchType dispatchType,
         const nvrhi::BufferRange& tessCounterRange, nvrhi::ICommandList* commandList);
+    void UpdateTessRate(uint32_t tessCounterIndex, nvrhi::ICommandList* commandList);
 
 protected:
     TessellatorConfig m_tessellatorConfig;
@@ -252,6 +262,9 @@ protected:
     nvrhi::BindingLayoutHandle m_copyClusterOffsetBL;
     nvrhi::ComputePipelineHandle m_copyClusterOffsetPSO;
 
+    nvrhi::BindingLayoutHandle m_updateTessRateBL;
+    nvrhi::ComputePipelineHandle m_updateTessRatePSO;
+
     nvrhi::BindingLayoutHandle m_fillClustersBL;
     nvrhi::ComputePipelineHandle m_fillClustersPSOs[FillClustersPermutation::kCount];
     nvrhi::ComputePipelineHandle m_fillClustersTexcoordsPSO;
@@ -271,7 +284,7 @@ protected:
     
     RTXMGBuffer<Cluster> m_clustersBuffer;
     RTXMGBuffer<nvrhi::rt::cluster::IndirectArgs> m_blasFromClasIndirectArgsBuffer;
-    RTXMGBuffer<nvrhi::rt::cluster::IndirectInstantiateTemplateArgs> m_clasIndirectArgDataBuffer;
+    RTXMGBuffer<nvrhi::rt::cluster::nv::IndirectInstantiateTemplateArgs> m_clasIndirectArgDataBuffer;
 
     uint32_t m_numInstances = 0;
     uint32_t m_sceneSubdPatches = 0;
@@ -284,8 +297,8 @@ protected:
         uint32_t                                quantNBits = 0;
         nvrhi::BufferHandle                     dataBuffer; // Holds the template data
         RTXMGBuffer<nvrhi::GpuVirtualAddress>   addressesBuffer; // Array of addresses within dataBuffer, one per template
-        RTXMGBuffer<uint32_t>                   instantiationSizesBuffer; // Size to instanstiate each template
-        std::vector<uint32_t>                   instantiationSizes;
+        ClusterOperationSizesBuffer instantiationSizesBuffer; // Size to instanstiate each template
+        std::vector<uint64_t> instantiationSizes;
     };
     TemplateBuffers m_templateBuffers; // Buffers used to Create templates. They are created once but need to be persistent throughout the app's run time.
     

@@ -40,6 +40,7 @@
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
+#include <nvrhi/d3d12.h>
 #endif
 
 #include <filesystem>
@@ -50,13 +51,16 @@
 #include "rtxmg/profiler/statistics.h"
 #include "rtxmg/profiler/stats_dump.h"
 #include "rtxmg/scene/scene.h"
-#include "rtxmg/scene/json.h"   // readFile — .json cluster-model pre-import in LoadScene
+#include "rtxmg/scene/json.h"   // readFile
 #include "rtxmg/cluster_lod/baking/bake_progress.h"  // loading-bar progress for the metadata pre-build
 #include "rtxmg/subdivision/subdivision_surface.h"
 #include "rtxmg/cluster_tess/tessellator_config.h"
 #include "rtxmg/utils/buffer.h"
+#include "rtxmg/utils/cluster_operation.h"
 #include "rtxmg/utils/debug.h"
+#include "rtxmg/utils/system_memory.h"
 #include "rtxmg/utils/texture_bytes.h"
+#include "rtxmg/utils/vram_bytes.h"
 
 #include "lerp_keyframes_params.h"
 
@@ -64,6 +68,10 @@
 #include <GLFW/glfw3.h>
 
 #if DONUT_WITH_VULKAN
+// Use donut's dispatcher; nothing links the Vulkan loader statically.
+#ifndef VULKAN_HPP_DISPATCH_LOADER_DYNAMIC
+#define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
+#endif
 #include <vulkan/vulkan.hpp>
 #endif
 
@@ -126,6 +134,38 @@ namespace fs = std::filesystem;
 
 // Sample application, so use dummy app id
 static constexpr int kStreamlineAppId = 1;
+
+static constexpr char const* kDxrRequirements =
+    "DXR clusters need an NVIDIA GPU with driver 621.01 or later and Windows Developer Mode enabled. "
+    "Run with --cluster-api nvapi or -vk instead.";
+
+static const char* GetClusterApiName(nvrhi::IDevice* device)
+{
+    switch (GetClusterApi(device))
+    {
+    case nvrhi::ClusterApi::Nv:
+        return device->getGraphicsAPI() == nvrhi::GraphicsAPI::VULKAN ? "VK_NV_cluster_acceleration_structure" : "NVAPI";
+    case nvrhi::ClusterApi::Dxr:
+        return "DXR clusters";
+    default:
+        return "none";
+    }
+}
+
+static void RequireDxrSupport(nvrhi::IDevice* device, Args::ClusterApiRequest request)
+{
+    const nvrhi::ClusterApi api = GetClusterApi(device);
+    if (request == Args::ClusterApiRequest::Dxr && api != nvrhi::ClusterApi::Dxr)
+    {
+#if !NVRHI_D3D12_WITH_DXRCLUSTER
+        log::fatal("--cluster-api dxr needs a build configured with -DNVRHI_D3D12_WITH_DXRCLUSTER=ON");
+#endif
+        log::fatal("The device does not support DXR clusters.\n\n%s", kDxrRequirements);
+    }
+    // The experimental SM 6.10 is only reported when Developer Mode let it be enabled.
+    if (api == nvrhi::ClusterApi::Dxr && !device->queryFeatureSupport(nvrhi::Feature::RayTracingPositionFetch))
+        log::fatal("Shader Model 6.10 is not available.\n\n%s", kDxrRequirements);
+}
 
 // search "up-ward" from the start path for a given directory name
 static fs::path findDir(fs::path const& startPath, fs::path const& dirname,
@@ -347,13 +387,7 @@ void RTXMGDemoApp::UpdateParams()
         GetRenderer().SetUseHardCull(m_args.useHardCull);
         GetRenderer().SetHardCullForcesInvisible(m_args.hardCullForcesInvisible);
         GetRenderer().SetUseHizOcclusion(m_args.useHizOcclusion);
-        GetRenderer().SetClasPoolOverrideMB(m_args.clasPoolOverrideMB);
-        GetRenderer().SetMaxFrameLoadRequests(m_args.maxFrameLoadRequests);
-        GetRenderer().SetMaxResidentGroups(m_args.maxResidentGroups);
-        GetRenderer().SetMaxGeometryMB(m_args.maxGeometryMB);
-        GetRenderer().SetMaxClasMB(m_args.maxClasMB);
         GetRenderer().SetClasPositionTruncateBits(m_args.clasPositionTruncateBits);
-        GetRenderer().SetRenderClusterBits(m_args.renderClusterBits);
         GetRenderer().SetDebugClusterLod(m_args.debugClusterLod);
         // Synced before the first streaming init: decides whether resident
         // group blobs keep their normal words (-cvn / Vertex Normals toggle).
@@ -406,17 +440,17 @@ RTXMGDemoApp::RTXMGDemoApp(app::DeviceManager* deviceManager,
 
     if (!m_args.shotListFile.empty())
     {
-        if (!LoadShotList(m_args.shotListFile, m_shotEntries))
+        if (!LoadShotList(m_args.shotListFile, m_shotPositions, m_shotConfigs))
             std::exit(EXIT_FAILURE);  // a malformed list must not silently render nothing
         // Loading normal maps is a scene-reload setting, so a list that toggles
         // shading is inert without --normalmaps -- and an inert sweep renders N
-        // identical entries that look like a real result.
+        // identical configs that look like a real result.
         if (!m_args.enableNormalMaps)
-            for (const ShotEntry& e : m_shotEntries)
-                if (e.normalMapShading > 0)
+            for (const ShotConfig& config : m_shotConfigs)
+                if (config.normalMapShading > 0)
                 {
                     log::warning("--shot-list '%s' sets normalMapShading, but --no-normalmaps "
-                                 "left nothing to shade with.", e.label.c_str());
+                                 "left nothing to shade with.", config.name.c_str());
                     break;
                 }
         if (m_args.shotOutDir.empty())
@@ -490,6 +524,22 @@ RTXMGDemoApp::RTXMGDemoApp(app::DeviceManager* deviceManager,
         deviceParams.enableRayTracingValidation = true;
     }
 
+    deviceParams.enableDxrClusters = m_args.clusterApi != Args::ClusterApiRequest::Nvapi;
+    deviceParams.enableNvapiClusters = m_args.clusterApi != Args::ClusterApiRequest::Dxr;
+
+#if NVRHI_D3D12_WITH_DXRCLUSTER
+    // NVAPI cluster intrinsics return invalid data under GPU-based validation, so the NVAPI path
+    // uses the DXR cluster intrinsics instead, when Developer Mode allows them.
+    if (deviceManager->GetGraphicsAPI() == nvrhi::GraphicsAPI::D3D12 && m_args.gpuValidation &&
+        m_args.clusterApi == Args::ClusterApiRequest::Nvapi)
+    {
+        m_forceDxrClusterIntrinsics = nvrhi::d3d12::enableExperimentalFeatures(&m_messageCallback);
+        if (!m_forceDxrClusterIntrinsics)
+            log::warning("NVAPI cluster intrinsics are unreliable under GPU-based validation (-gd); "
+                         "enable Windows Developer Mode to avoid corrupted rendering.");
+    }
+#endif
+
     if (m_args.aftermath)
     {
 #if DONUT_WITH_AFTERMATH
@@ -510,6 +560,10 @@ RTXMGDemoApp::RTXMGDemoApp(app::DeviceManager* deviceManager,
     if (!deviceManager->CreateWindowDeviceAndSwapChain(deviceParams,
         windowTitle.c_str()))
     {
+#if NVRHI_D3D12_WITH_DXRCLUSTER
+        if (deviceManager->GetGraphicsAPI() == nvrhi::GraphicsAPI::D3D12 && deviceParams.enableDxrClusters)
+            log::fatal("Cannot initialize a graphics device.\n\n%s", kDxrRequirements);
+#endif
         log::fatal(
             "Cannot initialize a graphics device with the requested parameters");
     }
@@ -565,6 +619,9 @@ RTXMGDemoApp::RTXMGDemoApp(app::DeviceManager* deviceManager,
     }
 #endif
 
+    if (deviceManager->GetGraphicsAPI() == nvrhi::GraphicsAPI::D3D12)
+        RequireDxrSupport(deviceManager->GetDevice(), m_args.clusterApi);
+
     if (!deviceManager->GetDevice()->queryFeatureSupport(
         nvrhi::Feature::RayTracingPipeline))
     {
@@ -577,6 +634,22 @@ RTXMGDemoApp::RTXMGDemoApp(app::DeviceManager* deviceManager,
         log::fatal("The graphics device does not support Clusters");
     }
 
+    {
+#if defined(_M_ARM64) || defined(__aarch64__)
+        const char* arch = "arm64";
+#else
+        const char* arch = "x64";
+#endif
+        const char* clusterApi = GetClusterApiName(deviceManager->GetDevice());
+        log::info("Cluster acceleration structures: %s", clusterApi);
+
+        if (deviceManager->GetGraphicsAPI() == nvrhi::GraphicsAPI::D3D12)
+            windowTitle += std::string(" (D3D12 ") + clusterApi + " " + arch + ")";
+        else
+            windowTitle += std::string(" (VULKAN ") + arch + ")";
+        deviceManager->SetWindowTitle(windowTitle.c_str());
+    }
+
     if (!deviceManager->GetDevice()->queryFeatureSupport(
         nvrhi::Feature::HeapDirectlyIndexed))
     {
@@ -584,17 +657,16 @@ RTXMGDemoApp::RTXMGDemoApp(app::DeviceManager* deviceManager,
     }
 
     {
-        // The cluster-LOD shaders partition groupshared scratch and size their
-        // sector/task grids by the compile-time kWaveSize, and traversal_run
-        // packs its ballots into a single uint32.  A wider wave mis-indexes all
-        // three, so gate on it here rather than render garbage.
+        // The wave-dependent compute shaders assume kWaveSize lanes and pin it with
+        // [WaveSize] on D3D12, which needs the device to support that width. Vulkan
+        // reports a single subgroup size, so there it must already be kWaveSize.
         nvrhi::WaveLaneCountMinMaxFeatureInfo waveLanes = {};
         deviceManager->GetDevice()->queryFeatureSupport(nvrhi::Feature::WaveLaneCountMinMax,
                                                         &waveLanes, sizeof(waveLanes));
-        if (waveLanes.minWaveLaneCount != shaderio::kWaveSize || waveLanes.maxWaveLaneCount != shaderio::kWaveSize)
+        if (waveLanes.minWaveLaneCount > shaderio::kWaveSize || waveLanes.maxWaveLaneCount < shaderio::kWaveSize)
         {
             log::fatal("The graphics device reports a wave size of %u..%u; the cluster-LOD "
-                       "shaders require exactly %u",
+                       "shaders require %u",
                        waveLanes.minWaveLaneCount, waveLanes.maxWaveLaneCount, shaderio::kWaveSize);
         }
     }
@@ -620,7 +692,8 @@ RTXMGRenderer& RTXMGDemoApp::GetRenderer()
     {
         RTXMGRenderer::Options rendererOptions{
             .params = m_renderParams,
-            .device = GetDevice()
+            .device = GetDevice(),
+            .forceDxrClusterIntrinsics = m_forceDxrClusterIntrinsics
         };
 
         m_renderer = std::make_unique<RTXMGRenderer>(rendererOptions);
@@ -781,9 +854,6 @@ bool RTXMGDemoApp::Init()
     m_CommonPasses = renderer.GetCommonPasses();
     m_commandList = GetDevice()->createCommandList();
 
-    m_lerpKeyFramesParamsBuffer = GetDevice()->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(
-        sizeof(LerpKeyFramesParams), "LerpKeyFramesParams", engine::c_MaxRenderPassConstantBufferVersions));
-
     // One loading path for interactive and headless (-nf) runs alike, so the
     // loading screen is always visible.  -nf frame counts stay deterministic
     // because the exit / screenshot / pixel-debug checks count from
@@ -865,28 +935,6 @@ void RTXMGDemoApp::HandleSceneLoad(const std::string& sceneFileName,
     // runs on this thread while AdvanceLoad drives the rest a step per frame.
     m_loadResult = std::async(std::launch::async,
         [this, nativeFS, sceneFileName]() { return LoadScene(nativeFS, sceneFileName); });
-}
-
-// Shared by the direct-gltf prebake path (LoadScene) and RTXMGScene's importer
-// sites, so the bake-affecting flags behave identically for both scene formats.
-static BakerConfig MakeBakerConfig(const Args& args)
-{
-    BakerConfig cfg;
-    cfg.useCompressedData = args.compressClusterData;
-    if (args.clusterTriangles)
-        cfg.clusterTriangles = args.clusterTriangles;
-    if (args.clusterVertices)
-        cfg.clusterVertices = args.clusterVertices;
-    if (args.simplifyNormalWeight >= 0.f)
-        cfg.simplifyNormalWeight = args.simplifyNormalWeight;
-    if (args.simplifyTexCoordWeight >= 0.f)
-        cfg.simplifyTexCoordWeight = args.simplifyTexCoordWeight;
-    if (args.lodErrorMergePrevious >= 0.f)
-        cfg.lodErrorMergePrevious = args.lodErrorMergePrevious;
-    if (args.lodErrorMergeAdditive >= 0.f)
-        cfg.lodErrorMergeAdditive = args.lodErrorMergeAdditive;
-    cfg.quantizeTexCoords = args.quantizeTexCoords;
-    return cfg;
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,25 +1128,11 @@ void RTXMGDemoApp::AdvanceLoad(nvrhi::IFramebuffer* framebuffer, bool texturesPr
         for (auto& cl : m_pendingUploadCLs)
             GetDevice()->executeCommandList(cl);
         m_pendingUploadCLs.clear();
-        m_loadPhase = LoadPhase::Metadata;
-        break;
-
-    case LoadPhase::Metadata:
-        if (m_loadingScene && !m_loadingScene->IsClusterLodPrebuiltMetadataComplete())
-        {
-            m_commandList->open();
-            m_loadingScene->PumpClusterLodPrebuiltMetadataUploads(m_commandList, 15.0);
-            m_commandList->close();
-            GetDevice()->executeCommandList(m_commandList);
-        }
-        else
-        {
-            m_loadPhase = LoadPhase::Textures;
-            m_textureLoadStart = std::chrono::steady_clock::now();
-            if (m_TextureCache && m_TextureCache->GetNumberOfRequestedTextures() > 0)
-                log::info("Texture load: uploading %u textures...",
-                          m_TextureCache->GetNumberOfRequestedTextures());
-        }
+        m_loadPhase = LoadPhase::Textures;
+        m_textureLoadStart = std::chrono::steady_clock::now();
+        if (m_TextureCache && m_TextureCache->GetNumberOfRequestedTextures() > 0)
+            log::info("Texture load: uploading %u textures...",
+                      m_TextureCache->GetNumberOfRequestedTextures());
         break;
 
     case LoadPhase::Textures:
@@ -1170,6 +1204,8 @@ void RTXMGDemoApp::ReconcileLoadedScene()
 
     m_scene                   = std::move(m_loadingScene);
     m_accelBuilderNeedsUpdate = true;
+    // Only a cluster_tess build refills these, and a scene without subd never runs one.
+    m_BuildStats              = {};
 
     // The command line still outranks the scene file, but only over what a scene
     // file can set — the SceneArgs slice.  Re-parsing argv into m_args itself
@@ -1268,7 +1304,7 @@ void RTXMGDemoApp::BuildLoadedScene()
         }
         // Must run with the command list open so CreateAccelStructs can upload
         // the cluster-LOD GPU buffers.
-        renderer.SceneFinishedLoading(m_scene, m_commandList);
+        renderer.SceneFinishedLoading(m_scene, m_args.clodBudgets, m_commandList);
     }
     m_commandList->close();
     GetDevice()->executeCommandList(m_commandList);
@@ -1341,13 +1377,14 @@ void RTXMGDemoApp::UpdateTextureMemStats()
     m_textureMemFinalizedMark = finalized;
 
     std::unordered_set<const donut::engine::LoadedTexture*> counted;
-    uint64_t bytes = 0, otherBytes = 0;
+    uint64_t bytes = 0, otherBytes = 0, vramBytes = 0;
     auto account = [&](const std::shared_ptr<donut::engine::LoadedTexture>& tex)
     {
         if (!tex || !tex->texture || !counted.insert(tex.get()).second)
             return;
         const uint64_t b = rtxmg::TextureGpuBytes(tex->texture->getDesc());
         bytes += b;
+        vramBytes += rtxmg::TextureVramBytes(GetDevice(), tex->texture);
         // Split out the formats the budget pre-pass couldn't size from their
         // headers (.jpg/.png/...): their resident size is also their full size,
         // so the Memory tab folds them into its full-resolution denominator.
@@ -1373,7 +1410,66 @@ void RTXMGDemoApp::UpdateTextureMemStats()
     stats::TextureMemStats& tm = stats::memUsageSamplers.textures;
     tm.loadedBytes      = bytes;
     tm.loadedOtherBytes = otherBytes;
+    tm.vramBytes        = vramBytes;
     tm.loadedCount      = uint32_t(counted.size());
+}
+
+void RTXMGDemoApp::LogTessellationLimit()
+{
+    const auto& want = m_BuildStats.desired;
+    const auto& have = m_BuildStats.allocated;
+    const bool exceeded = want.m_numClusters > have.m_numClusters ||
+                          want.m_clasSize > have.m_clasSize ||
+                          want.m_vertexBufferSize > have.m_vertexBufferSize ||
+                          want.m_vertexNormalsBufferSize > have.m_vertexNormalsBufferSize;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!exceeded)
+    {
+        if (m_tessLimitLogged)
+            log::info("Tessellation back within its budget.");
+        m_tessLimitLogged = false;
+        return;
+    }
+    if (m_tessLimitLogged && now - m_tessLimitLogTime < std::chrono::seconds(10))
+        return;
+
+    constexpr double kMiB = 1024.0 * 1024.0;
+    log::warning("Tessellation budget exceeded, clusters will be dropped: clusters %u / %u, "
+                 "CLAS %.0f / %.0f MiB, vertices %.0f / %.0f MiB, normals %.0f / %.0f MiB (desired / allocated)",
+                 want.m_numClusters, have.m_numClusters,
+                 double(want.m_clasSize) / kMiB, double(have.m_clasSize) / kMiB,
+                 double(want.m_vertexBufferSize) / kMiB, double(have.m_vertexBufferSize) / kMiB,
+                 double(want.m_vertexNormalsBufferSize) / kMiB, double(have.m_vertexNormalsBufferSize) / kMiB);
+    m_tessLimitLogged  = true;
+    m_tessLimitLogTime = now;
+}
+
+float RTXMGDemoApp::GetTessBudgetLoad() const
+{
+    const auto& want = m_BuildStats.desired;
+    const auto& have = m_BuildStats.allocated;
+    auto ratio = [](double desired, double allocated) { return allocated > 0.0 ? float(desired / allocated) : 0.f; };
+    return std::max({ ratio(want.m_numClusters, have.m_numClusters),
+                      ratio(double(want.m_clasSize), double(have.m_clasSize)),
+                      ratio(double(want.m_vertexBufferSize), double(have.m_vertexBufferSize)),
+                      ratio(double(want.m_vertexNormalsBufferSize), double(have.m_vertexNormalsBufferSize)) });
+}
+
+void RTXMGDemoApp::LogAdaptiveTessRate()
+{
+    // Log each 10% move, plus the return to the user's rates.
+    const float scale  = m_BuildStats.tessRateScale;
+    const float logged = m_adaptiveTessLoggedScale;
+    if (scale > logged * 1.1f || scale < logged / 1.1f || (scale == 1.f && logged != 1.f))
+    {
+        const auto& s = m_BuildStats;
+        log::info("adaptive-tess-rate frame=%u load=%.3f scale=%.3f fineRate=%.4f "
+                  "(clusters %.3f, CLAS %.3f, vertices %.3f)",
+                  GetFrameIndex(), GetTessBudgetLoad(), scale, m_args.fineTessellationRate * scale,
+                  s.clusterRateScale, s.clasRateScale, s.vertexRateScale);
+        m_adaptiveTessLoggedScale = scale;
+    }
 }
 
 void RTXMGDemoApp::UpdateVramBreakdown()
@@ -1381,7 +1477,7 @@ void RTXMGDemoApp::UpdateVramBreakdown()
     const RTXMGRenderer& renderer = GetRenderer();
 
     stats::VramBreakdown vb;
-    vb.textures      = stats::memUsageSamplers.textures.loadedBytes;
+    vb.textures      = stats::memUsageSamplers.textures.vramBytes;
     vb.envmap        = renderer.GetEnvMapBytes();
     vb.renderTargets = renderer.GetRenderTargetBytes();
 
@@ -1392,6 +1488,7 @@ void RTXMGDemoApp::UpdateVramBreakdown()
     vb.tessVertices    = tess.m_vertexBufferSize + tess.m_vertexNormalsBufferSize;
     vb.tessClas        = tess.m_clasSize;
     vb.tessClusterData = tess.m_clusterDataSize;
+    vb.tessSurfaces    = (m_scene ? m_scene->GetSubdVramBytes() : 0) + renderer.GetClusterTessWorkingBytes();
     // `desired` is this frame's demand against those buffers, and can exceed them
     // — that overflow is what the budget fields flash red for.
     const auto& tessWant = m_BuildStats.desired;
@@ -1400,8 +1497,23 @@ void RTXMGDemoApp::UpdateVramBreakdown()
     vb.tessClusterDataUsed = tessWant.m_clusterDataSize;
     // Cluster-LoD dynamic BLAS is a separate pool from cluster_tess's, and both
     // can be live in a mixed scene.
-    vb.blas            = tess.m_blasSize + tess.m_blasScratchSize
-                       + renderer.GetClusterLodBlasActualBytes();
+    const uint64_t tlas = renderer.GetTlasBytes();
+    vb.blas            = tess.m_blasSize + renderer.GetClusterLodBlasBufferBytes() + tlas;
+    vb.blasUsed        = std::min(tessWant.m_blasSize, tess.m_blasSize)
+                       + renderer.GetClusterLodBlasActualBytes() + tlas;
+    // Every AS build takes its scratch from here, including cluster_tess's.
+    vb.asScratch       = m_commandList ? m_commandList->getInternalMemoryUsage().scratchBytes : 0;
+
+#if DONUT_WITH_STREAMLINE
+    {
+        // Both features: switching denoiser modes does not free the other one.
+        donut::app::StreamlineInterface& streamline = donut::app::DeviceManager::GetStreamline();
+        uint64_t dlssBytes = 0, dlssRrBytes = 0;
+        streamline.QueryDLSSState(dlssBytes);
+        streamline.QueryDLSSRRState(dlssRrBytes);
+        vb.dlss = dlssBytes + dlssRrBytes;
+    }
+#endif
 
     // Traversal + BLAS-build tables exist on the preload path too, so this is
     // outside the streaming query below.
@@ -1460,7 +1572,7 @@ void RTXMGDemoApp::ApplyStreamingBudgets()
     // The current pools may still be in flight, hence the idle on both sides.
     GetDevice()->waitForIdle();
     m_commandList->open();
-    GetRenderer().ReinitAccelStructs(m_commandList);
+    GetRenderer().ReinitAccelStructs(m_args.clodBudgets, m_commandList);
     m_commandList->close();
     GetDevice()->executeCommandList(m_commandList);
     GetDevice()->waitForIdle();
@@ -1528,7 +1640,9 @@ void RTXMGDemoApp::ResetCamera()
 
     if (!m_args.camString.empty())
     {
-        m_camera.Set(m_args.camString);
+        if (!m_camera.Set(m_args.camString))
+            log::warning("Ignoring malformed camera '%s'; expected [eye][lookat][up]fovY.",
+                         m_args.camString.c_str());
     }
     else if (!useGridFraming && m_scene->GetView())
     {
@@ -1563,7 +1677,7 @@ void RTXMGDemoApp::ResetCamera()
     m_camera.SetAspectRatio(float(m_displaySize.x) / float(m_displaySize.y));
 
     m_trackBall.SetGimbalLock(true);
-    m_trackBall.SetCamera(&m_camera);
+    SyncTrackballToCamera();
     // Default move speed (world units/second) from the MEDIAN world-space
     // instance size: robust against a handful of huge background vista
     // instances, which inflate the average.
@@ -1574,6 +1688,20 @@ void RTXMGDemoApp::ResetCamera()
     m_trackBall.SetMoveSpeed(moveSpeed);
     donut::log::info("Camera move speed: %.3f u/s (median instance size; avg %.3f)",
                      moveSpeed, m_scene->GetAttributes().averageInstanceScale);
+}
+
+void RTXMGDemoApp::ResetView()
+{
+    if (!m_scene)
+        return;
+    ResetCamera();
+    GetRenderer().SetExposure(m_args.exposure);
+    GetRenderer().SetAutoExposure(m_args.autoExposure);
+}
+
+void RTXMGDemoApp::SyncTrackballToCamera()
+{
+    m_trackBall.SetCamera(&m_camera);
     m_trackBall.SetReferenceFrame({ 1.f, 0.f, 0.f }, { 0.f, 0.f, 1.f },
         { 0.f, 1.f, 0.f });
 }
@@ -1587,7 +1715,6 @@ bool RTXMGDemoApp::LoadScene(std::shared_ptr<vfs::IFileSystem> fs,
     // because it races the Streamline-wrapped present.
     m_pendingSceneFs   = fs;
     m_pendingSceneFile = sceneFileName;
-    m_pendingClusterModels.clear();
     m_pendingUploadCLs.clear();
 
     // Leave a couple of cores for the present + GPU-finalize thread — saturating
@@ -1599,79 +1726,19 @@ bool RTXMGDemoApp::LoadScene(std::shared_ptr<vfs::IFileSystem> fs,
         m_textureLoadPool = std::make_unique<donut::engine::ThreadPool>(workers);
     }
 
-    // One command list per worker — nvrhi command lists are per-thread.  The
-    // closed lists are submitted on the main thread.
-    auto buildModelMetadata = [&](const ClusterLodModel& model)
-        -> std::vector<ClusterLodPrebuiltGeometryMetadata>
-    {
-        const size_t numGeom = model.geometries.size();
-        if (numGeom == 0)
-            return {};
-
-        const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
-        const uint32_t workerCount =
-            std::min<uint32_t>({ 16u, hw > 4 ? hw - 2 : hw, uint32_t(numGeom) });
-
-        rtxmg::GetBakeProgress().Begin(uint32_t(numGeom), 0, workerCount,
-                                    "Uploading cluster LOD geometry");
-        struct EndGuard { ~EndGuard() { rtxmg::GetBakeProgress().End(); } } endGuard;
-
-        const auto t0 = std::chrono::steady_clock::now();
-        std::vector<ClusterLodPrebuiltGeometryMetadata> metadata(numGeom);
-        std::vector<nvrhi::CommandListHandle>     workerCLs(workerCount);
-        std::atomic<uint32_t>                     nextGeom{ 0 };
-
-        donut::engine::DescriptorTableManager* dt = GetRenderer().GetDescriptorTable().get();
-        nvrhi::IDevice*                        device = GetDevice();
-        for (uint32_t w = 0; w < workerCount; ++w)
-        {
-            m_textureLoadPool->AddTask([&, w]()
-            {
-                // Deferred (non-immediate): nvrhi allows only ONE immediate list
-                // open at a time, and every worker records concurrently.
-                nvrhi::CommandListHandle cl = device->createCommandList(
-                    nvrhi::CommandListParameters().setEnableImmediateExecution(false));
-                cl->open();
-                for (uint32_t i; (i = nextGeom.fetch_add(1, std::memory_order_relaxed)) < numGeom;)
-                {
-                    if (m_loadCancelled.load(std::memory_order_relaxed))
-                        break;
-                    metadata[i] = ClusterLodPrebuiltGeometryMetadata::Build(
-                        model.geometries[i], dt, device, cl);
-                    rtxmg::GetBakeProgress().CompleteOne(w);
-                }
-                cl->close();
-                workerCLs[w] = std::move(cl);
-            });
-        }
-        m_textureLoadPool->WaitForTasks();
-
-        for (auto& cl : workerCLs)
-            if (cl)
-                m_pendingUploadCLs.push_back(std::move(cl));
-
-        log::info("LoadScene: pre-built cluster-LOD geometry metadata for %zu geometries "
-                  "in %.0f ms (%u load-pool workers)",
-                  numGeom,
-                  std::chrono::duration<double, std::milli>(
-                      std::chrono::steady_clock::now() - t0).count(),
-                  workerCount);
-        return metadata;
-    };
-
     // Capture available RAM and effective worker count for the bake report.
     uint64_t ramBeforeMiB = 0;
     {
-        MEMORYSTATUSEX ms{}; ms.dwLength = sizeof(ms);
-        if (GlobalMemoryStatusEx(&ms))
+        rtxmg::SystemMemory ms;
+        if (rtxmg::QuerySystemMemory(ms))
         {
-            ramBeforeMiB = ms.ullAvailPhys >> 20;
+            ramBeforeMiB = ms.availableBytes >> 20;
             uint32_t w = m_pendingBakeReport.workerThreads;
             if (w == 0)
             {
                 const uint32_t cores = std::max(1u, std::thread::hardware_concurrency());
                 const uint64_t budget =
-                    (ms.ullTotalPhys - (8ull << 30)) / (2ull << 30);
+                    (ms.totalBytes - (8ull << 30)) / (2ull << 30);
                 w = m_args.bakeWorkers > 0 ? m_args.bakeWorkers
                   : uint32_t(std::clamp<uint64_t>(budget, 1, cores));
             }
@@ -1679,83 +1746,6 @@ bool RTXMGDemoApp::LoadScene(std::shared_ptr<vfs::IFileSystem> fs,
         }
     }
     const auto bakeT0 = std::chrono::steady_clock::now();
-
-    const auto ext = sceneFileName.extension();
-    if (ext == ".gltf" || ext == ".glb")
-    {
-        ClusterLodGltfImporter importer(GetCurrentBakerConfig(), /*log*/ true,
-                                        m_args.clusterCacheDir, m_args.bakeWorkers);
-        auto model = importer.Load(sceneFileName);
-        if (!model.has_value())
-        {
-            m_pendingUploadCLs.clear();  // workers already closed their lists
-            log::fatal("Failed to bake scene from file: %s", sceneFileName.string().c_str());
-            return false;
-        }
-        auto metadata = buildModelMetadata(*model);
-        m_pendingClusterModels.push_back({ fs::path(sceneFileName).lexically_normal(),
-                                           std::move(*model), std::move(metadata) });
-    }
-    else if (ext == ".json")
-    {
-        // Mirrors RTXMGScene::LoadSceneFile's model discovery/resolution.  Parse
-        // errors are left to the scene loader: this phase is best-effort, since
-        // a missed prebake just means an inline import later.
-        try
-        {
-            const Json::Value jsonRoot = readFile(sceneFileName);
-            const Json::Value& models  = jsonRoot["models"];
-            const Json::Value& graph   = jsonRoot["graph"];
-            if (models.isArray() && graph.isArray())
-            {
-                for (uint32_t i = 0; i < graph.size(); ++i)
-                {
-                    const Json::Value& modelNode = graph[i]["model"];
-                    if (!modelNode.isIntegral())
-                        continue;
-                    const int modelIndex = modelNode.asInt();
-                    if (modelIndex < 0 || modelIndex >= (int)models.size() ||
-                        !models[modelIndex].isString())
-                        continue;
-
-                    const fs::path modelPath = models[modelIndex].asString();
-                    const auto     modelExt  = modelPath.extension();
-                    if (modelExt != ".gltf" && modelExt != ".glb")
-                        continue;
-
-                    const fs::path parent = fs::path(sceneFileName).parent_path();
-                    const fs::path resolvedPath =
-                        rtxmg::ResolveMediapath(parent / modelPath, GetMediaPath());
-                    const fs::path loadPath =
-                        (resolvedPath.empty() ? parent / modelPath : resolvedPath).lexically_normal();
-
-                    // Same model referenced by several graph nodes: import once.
-                    bool alreadyImported = false;
-                    for (const auto& pending : m_pendingClusterModels)
-                        if (pending.path == loadPath) { alreadyImported = true; break; }
-                    if (alreadyImported)
-                        continue;
-
-                    ClusterLodGltfImporter importer(GetCurrentBakerConfig(), /*log*/ true,
-                                                    m_args.clusterCacheDir, m_args.bakeWorkers);
-                    if (auto model = importer.Load(loadPath); model.has_value())
-                    {
-                        auto metadata = buildModelMetadata(*model);
-                        m_pendingClusterModels.push_back({ loadPath, std::move(*model),
-                                                           std::move(metadata) });
-                    }
-                }
-            }
-        }
-        catch (const std::exception& e)
-        {
-            log::warning("LoadScene: .json cluster-model pre-import skipped: %s", e.what());
-        }
-    }
-
-    // Bail before the scene half; the destructor is waiting on us.
-    if (m_loadCancelled.load(std::memory_order_relaxed))
-        return false;
 
     stats::evaluatorSamplers = {};
     stats::memUsageSamplers  = {};
@@ -1772,38 +1762,11 @@ bool RTXMGDemoApp::LoadScene(std::shared_ptr<vfs::IFileSystem> fs,
         .isoLevelSmooth     = m_args.isoLevelSmooth,
         .clusterBakerConfig       = GetCurrentBakerConfig(),
         .clusterCacheDir          = m_args.clusterCacheDir,
+        .clusterBakeWorkers       = m_args.bakeWorkers,
+        .cancelLoad               = &m_loadCancelled,
     });
     scene->SetEnableMaterials(m_args.enableMaterials);
     scene->SetEnableNormalMaps(m_args.enableNormalMaps);
-
-    {
-        auto& a = m_pendingBakeReport.after;
-        a = {};
-        a.valid = true;
-        for (const auto& pm : m_pendingClusterModels)
-        {
-            a.geometries += uint32_t(pm.model.geometries.size());
-            for (const auto& geo : pm.model.geometries)
-                for (const auto& l : geo.lodStats)
-                {
-                    a.groups      += l.totGroups;
-                    a.clusters    += l.totClusters;
-                    a.triangles   += l.totTris;
-                    a.bakedBytes  += l.totBytes;
-                    a.deviceBytes += l.totDeviceBytes;
-                    a.compressed   = a.compressed  || bool(l.compressed);
-                    a.quantizedUv  = a.quantizedUv || bool(l.quantUv);
-                }
-        }
-        const BakerConfig afterCfg = GetCurrentBakerConfig();
-        a.compressionPosDropBits = afterCfg.compressionPosDropBits;
-        a.compressionTexDropBits = afterCfg.compressionTexDropBits;
-    }
-
-    for (auto& pending : m_pendingClusterModels)
-        scene->AddPrebakedClusterModel(pending.path, std::move(pending.model),
-                                       std::move(pending.metadata));
-    m_pendingClusterModels.clear();
 
     // KTX2 texture mip budget: read texture headers, drop high-res mips to fit the
     // budget, and hand the scene its per-texture base mips BEFORE textures load.
@@ -1835,6 +1798,27 @@ bool RTXMGDemoApp::LoadScene(std::shared_ptr<vfs::IFileSystem> fs,
     if (!scene->LoadWithThreadPool(m_pendingSceneFile, m_textureLoadPool.get(), &m_pendingUploadCLs))
         return false;
 
+    {
+        auto& a = m_pendingBakeReport.after;
+        a = {};
+        a.valid = true;
+        a.geometries = uint32_t(scene->GetClusterLodGeometries().size());
+        for (const auto& geo : scene->GetClusterLodGeometries())
+            for (const auto& l : geo.lodStats)
+            {
+                a.groups      += l.totGroups;
+                a.clusters    += l.totClusters;
+                a.triangles   += l.totTris;
+                a.bakedBytes  += l.totBytes;
+                a.deviceBytes += l.totDeviceBytes;
+                a.compressed   = a.compressed  || bool(l.compressed);
+                a.quantizedUv  = a.quantizedUv || bool(l.quantUv);
+            }
+        const BakerConfig afterCfg = GetCurrentBakerConfig();
+        a.compressionPosDropBits = afterCfg.compressionPosDropBits;
+        a.compressionTexDropBits = afterCfg.compressionTexDropBits;
+    }
+
     // Pure CPU, and every input is known before the load starts (HandleSceneLoad
     // captures the UI-edited values, and the restore in ReconcileLoadedScene
     // outranks anything the scene file or the CLI re-parse could set).  Must run
@@ -1859,10 +1843,10 @@ bool RTXMGDemoApp::LoadScene(std::shared_ptr<vfs::IFileSystem> fs,
     m_pendingBakeReport.bakeSeconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - bakeT0).count();
     {
-        MEMORYSTATUSEX ms{}; ms.dwLength = sizeof(ms);
-        if (GlobalMemoryStatusEx(&ms))
+        rtxmg::SystemMemory ms;
+        if (rtxmg::QuerySystemMemory(ms))
             m_pendingBakeReport.memDeltaMiB =
-                (int64_t)ramBeforeMiB - (int64_t)(ms.ullAvailPhys >> 20);
+                (int64_t)ramBeforeMiB - (int64_t)(ms.availableBytes >> 20);
     }
     return true;
 }
@@ -1916,7 +1900,7 @@ bool RTXMGDemoApp::KeyboardUpdate(int key, int scancode, int action,
             m_camera.Print();
             break;
         case GLFW_KEY_F:
-            ResetCamera();
+            ResetView();
             break;
         case GLFW_KEY_R:
             if (mods & GLFW_MOD_CONTROL)
@@ -2137,7 +2121,7 @@ void RTXMGDemoApp::UpdateDLSSSettings()
         }
     }
 #else
-    denoiserMode = DenoiserMode::None;
+    DenoiserMode denoiserMode = DenoiserMode::None;
 #endif
 
     // Off, or disabled due to invalid settings.
@@ -2350,12 +2334,6 @@ void RTXMGDemoApp::Animate(float fElapsedTimeSeconds)
     m_animationUpdated = m_animationTime != animTime;
     if (m_animationUpdated)
     {
-        // animation looped so we need to reset
-        if (animTime == 0)
-        {
-            GetRenderer().ResetDenoiser();
-        }
-
         m_scene->Animate(animTime, animRate);
 
         GetRenderer().ResetSubframes();
@@ -2377,26 +2355,18 @@ void RTXMGDemoApp::LimitFrameRate()
         std::this_thread::sleep_until(nextFrameStart);
 }
 
-void RTXMGDemoApp::LerpVertices(
-    nvrhi::IBuffer* outBuffer,
-    nvrhi::IBuffer* keyFrame0Buffer,
-    nvrhi::IBuffer* keyFrame1Buffer,
-    unsigned int numVertices, float animTime)
+void RTXMGDemoApp::LerpPoses(const SubdivisionSurface& mesh, uint32_t firstPose, uint32_t numPoses)
 {
-    constexpr int blockSize = 32;
-    const int numBlocks = (numVertices + blockSize - 1) / blockSize;
-
-    LerpKeyFramesParams params;
-    params.numVertices = numVertices;
-    params.animTime = animTime;
-
-    m_commandList->writeBuffer(m_lerpKeyFramesParamsBuffer, &params, sizeof(LerpKeyFramesParams));
+    constexpr uint32_t blockSize = 64;
+    const uint32_t numVertices = mesh.NumVertices();
 
     auto bindingSetDesc = nvrhi::BindingSetDesc()
-        .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(0, keyFrame0Buffer))
-        .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(1, keyFrame1Buffer))
-        .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(0, outBuffer))
-        .addItem(nvrhi::BindingSetItem::ConstantBuffer(0, m_lerpKeyFramesParamsBuffer));
+        .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(0, mesh.m_positionKeyframes))
+        .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(1, m_lerpPosesBuffer, nvrhi::Format::UNKNOWN,
+            nvrhi::BufferRange(firstPose * sizeof(LerpKeyFramesPose), numPoses * sizeof(LerpKeyFramesPose))))
+        .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(0, mesh.m_posePositions))
+        .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(1, mesh.m_posePositionsPrev))
+        .addItem(nvrhi::BindingSetItem::PushConstants(0, sizeof(LerpKeyFramesConstants)));
 
     nvrhi::BindingSetHandle bindingSet;
     if (!nvrhi::utils::CreateBindingSetAndLayout(GetDevice(), nvrhi::ShaderType::Compute, 0, bindingSetDesc, m_lerpVerticesBL, bindingSet))
@@ -2419,27 +2389,43 @@ void RTXMGDemoApp::LerpVertices(
         .setPipeline(m_lerpVerticesPSO)
         .addBindingSet(bindingSet);
     m_commandList->setComputeState(state);
-    m_commandList->dispatch(numBlocks, 1, 1);
+
+    const LerpKeyFramesConstants constants{ .numVertices = numVertices, .poseStride = mesh.m_poseStride };
+    m_commandList->setPushConstants(&constants, sizeof(constants));
+    m_commandList->dispatch((numVertices + blockSize - 1) / blockSize, numPoses, 1);
 }
 
 void RTXMGDemoApp::DispatchGPUAnimation()
 {
+    const auto poses = m_scene->GetSubdPoses();
+    if (poses.empty())
+        return;
+
     nvrhi::utils::ScopedMarker marker(m_commandList, "GPU Animation");
 
-    auto& subdMeshes = m_scene->GetSubdMeshes();
-    for (auto& subd : subdMeshes)
+    std::vector<LerpKeyFramesPose> lerpPoses(poses.size());
+    for (size_t i = 0; i < poses.size(); ++i)
+        lerpPoses[i] = { .f0 = poses[i].f0, .f1 = poses[i].f1, .blend = poses[i].blend, ._pad = 0 };
+
+    const size_t bytes = lerpPoses.size() * sizeof(LerpKeyFramesPose);
+    if (!m_lerpPosesBuffer || m_lerpPosesBuffer->getDesc().byteSize < bytes)
     {
-        if (!subd->HasAnimation())
-            continue;
+        m_lerpPosesBuffer = GetDevice()->createBuffer(nvrhi::BufferDesc()
+            .setByteSize(bytes)
+            .setStructStride(sizeof(LerpKeyFramesPose))
+            .setDebugName("LerpKeyFramesPoses")
+            .setInitialState(nvrhi::ResourceStates::ShaderResource)
+            .setKeepInitialState(true));
+    }
+    m_commandList->writeBuffer(m_lerpPosesBuffer, lerpPoses.data(), bytes);
 
-        // Cache to previous
-        m_commandList->copyBuffer(subd->m_positionsPrevBuffer, 0, subd->m_positionsBuffer, 0, subd->m_positionsBuffer->getDesc().byteSize);
-
-        LerpVertices(subd->m_positionsBuffer,
-            subd->m_positionKeyframeBuffers[subd->m_f0],
-            subd->m_positionKeyframeBuffers[subd->m_f1],
-            subd->NumVertices(),
-            subd->m_dt);
+    // The scene keeps each mesh's poses contiguous: one dispatch per mesh.
+    auto& subdMeshes = m_scene->GetSubdMeshes();
+    for (uint32_t first = 0, last; first < poses.size(); first = last)
+    {
+        const uint32_t meshID = poses[first].meshID;
+        for (last = first + 1; last < poses.size() && poses[last].meshID == meshID; ++last) {}
+        LerpPoses(*subdMeshes[meshID], first, last - first);
     }
 }
 
@@ -2537,6 +2523,7 @@ void RTXMGDemoApp::RenderScene(nvrhi::IFramebuffer* framebuffer)
                 .tessMode = m_args.tessMode,
                 .fineTessellationRate = m_args.fineTessellationRate,
                 .coarseTessellationRate = m_args.coarseTessellationRate,
+                .enableAdaptiveTessRate = m_args.adaptiveTessRate,
                 .enableFrustumVisibility = m_args.enableFrustumVisibility,
                 .enableHiZVisibility = m_args.enableHiZVisibility,
                 .enableBackfaceVisibility = m_args.enableBackfaceVisibility,
@@ -2572,7 +2559,8 @@ void RTXMGDemoApp::RenderScene(nvrhi::IFramebuffer* framebuffer)
             if (updateAccel)
             {
                 renderer.UpdateAccelerationStructures(tessConfig, m_BuildStats, GetFrameIndex(), m_commandList);
-                m_accelBuilderNeedsUpdate = false;
+                // Keep building while the GPU is still moving the adaptive rate scale.
+                m_accelBuilderNeedsUpdate = m_BuildStats.tessRateAdjusted;
             }
         }
 
@@ -2617,6 +2605,11 @@ void RTXMGDemoApp::RenderScene(nvrhi::IFramebuffer* framebuffer)
     m_commandList->close();
     GetDevice()->executeCommandList(m_commandList);
 
+#if RTXMG_DEV_FEATURES
+    if (!m_args.animDumpDir.empty() && m_postLoadBaseFrame >= 0)
+        DumpAnimFrame(uint32_t(int(GetFrameIndex()) - m_postLoadBaseFrame));
+#endif
+
     profiler.FrameEnd();
 
     // Only the profiler's Overview graph samples the frame/trace/DLSS timers, so
@@ -2625,13 +2618,15 @@ void RTXMGDemoApp::RenderScene(nvrhi::IFramebuffer* framebuffer)
     // before submission reads whatever the timer's query ring held last -- which
     // lands different timers on different frames (trace appearing to exceed
     // frame).  Gated on the walk so an open profiler is not double-sampling.
-    if (!m_shotEntries.empty())
+    if (ShotListActive())
         stats::ProfileFrameTimers();
 
     // Outside the IsRecording() gate: not a time series, and the Memory tab
     // should read correctly with profiling paused.
     UpdateTextureMemStats();
     UpdateVramBreakdown();
+    LogTessellationLimit();
+    LogAdaptiveTessRate();
 
     if (profiler.IsRecording())
     {
@@ -2807,41 +2802,124 @@ void RTXMGDemoApp::RenderScene(nvrhi::IFramebuffer* framebuffer)
 // Streaming lands loads in batches, so a single flat frame is common mid-batch.
 static constexpr uint32_t kShotFlatFrames = 8;
 
+void RTXMGDemoApp::RunShotList(std::vector<ShotPosition> positions, std::vector<ShotConfig> configs)
+{
+    m_shotPositions    = std::move(positions);
+    m_shotConfigs      = std::move(configs);
+    m_shotConfigIndex   = 0;
+    m_shotPositionIndex = 0;
+    m_shotIndex          = 0;
+    m_shotPhase           = ShotPhase::Jump;
+    m_shotPhaseFrames     = 0;
+    m_shotInteractiveRun = true;
+
+    const RTXMGRenderer& renderer = GetRenderer();
+    ShotRestoreState     state{
+        .camera           = m_camera.ToString(),
+        .shadingMode      = renderer.GetShadingMode(),
+        .colorMode        = renderer.GetColorMode(),
+        .wireframe        = renderer.GetWireframe(),
+        .exposure         = renderer.GetExposure(),
+        .autoExposure     = renderer.GetAutoExposure(),
+        .dlssMode         = m_ui.dlssMode,
+        .lodPixelError    = renderer.GetLodPixelError(),
+        .adaptiveLodError = renderer.GetAdaptiveLodError(),
+        .normalMapShading = GetNormalMapShading(),
+        .monitor          = nullptr,
+    };
+    if (GLFWwindow* window = GetDeviceManager()->GetWindow())
+    {
+        state.monitor = glfwGetWindowMonitor(window);
+        glfwGetWindowPos(window, &state.windowX, &state.windowY);
+        glfwGetWindowSize(window, &state.windowW, &state.windowH);
+        state.decorated = glfwGetWindowAttrib(window, GLFW_DECORATED) == GLFW_TRUE;
+    }
+    m_shotRestore = state;
+}
+
+void RTXMGDemoApp::AbortShotList()
+{
+    m_shotPositions.clear();
+    m_shotConfigs.clear();
+    m_shotPhase           = ShotPhase::Done;
+    m_shotInteractiveRun = false;
+    RestoreAfterShotList();
+}
+
+void RTXMGDemoApp::RestoreAfterShotList()
+{
+    if (!m_shotRestore)
+        return;
+    const ShotRestoreState state = *m_shotRestore;
+    m_shotRestore.reset();
+
+    SetCameraString(state.camera);
+
+    RTXMGRenderer& renderer = GetRenderer();
+    renderer.SetShadingMode(state.shadingMode);
+    renderer.SetColorMode(state.colorMode);
+    renderer.SetWireframe(state.wireframe);
+    renderer.SetExposure(state.exposure);
+    renderer.SetAutoExposure(state.autoExposure);
+    renderer.SetLodPixelError(state.lodPixelError);
+    renderer.SetAdaptiveLodError(state.adaptiveLodError);
+    renderer.ResetAdaptiveLodError();
+    SetNormalMapShading(state.normalMapShading);
+    m_ui.dlssMode = state.dlssMode;
+
+    GLFWwindow* window = GetDeviceManager()->GetWindow();
+    if (!window)
+        return;
+    if (state.monitor)
+    {
+        const GLFWvidmode* mode = glfwGetVideoMode(state.monitor);
+        glfwSetWindowMonitor(window, state.monitor, 0, 0, mode->width, mode->height,
+                             mode->refreshRate);
+        return;
+    }
+    glfwSetWindowAttrib(window, GLFW_DECORATED, state.decorated ? GLFW_TRUE : GLFW_FALSE);
+    glfwSetWindowPos(window, state.windowX, state.windowY);
+    glfwSetWindowSize(window, state.windowW, state.windowH);
+}
+
 void RTXMGDemoApp::UpdateShotList()
 {
-    if (m_shotEntries.empty() || m_shotPhase == ShotPhase::Done)
+    if (!ShotListActive() || m_shotPhase == ShotPhase::Done)
         return;
 
-    const ShotEntry& entry    = m_shotEntries[m_shotEntryIndex];
-    RTXMGRenderer&   renderer = GetRenderer();
+    const ShotConfig&   config   = m_shotConfigs[m_shotConfigIndex];
+    const ShotPosition& pos      = m_shotPositions[m_shotPositionIndex];
+    RTXMGRenderer&       renderer = GetRenderer();
 
     switch (m_shotPhase)
     {
     case ShotPhase::Jump:
-        m_camera.Set(entry.camera);
-        m_cameraReset = true;  // read by SetRenderCamera below as a camera cut
-        // Before the settle, so residency converges under the settings the shot
-        // is captured with.  A DLSS mode change also resizes the render targets
-        // (m_ui.dlssMode is what the UI dropdown writes), which changes the
-        // pixel error's screen-space budget -- both need the settle to follow.
-        if (entry.outputWidth > 0 && entry.outputHeight > 0)
-            SetShotOutputResolution(entry);
-        if (entry.dlssModeSet)
-            m_ui.dlssMode = entry.dlssMode;
-        if (entry.lodPixelError > 0.f)
-            renderer.SetLodPixelError(entry.lodPixelError);
-        if (entry.adaptiveLodError >= 0)
-            renderer.SetAdaptiveLodError(entry.adaptiveLodError != 0);
-        if (entry.normalMapShading >= 0)
-            SetNormalMapShading(entry.normalMapShading != 0);
+        JumpCameraToShot(pos);  // read by SetRenderCamera below as a camera cut
+        // Reallocating settings apply once per config, at its first position:
+        // before the settle, so residency converges under the settings the
+        // shots are captured with, but not repeated (and not re-triggering a
+        // resolution/DLSS re-init) at every position under the same config.
+        if (m_shotPositionIndex == 0)
+        {
+            if (config.outputWidth > 0 && config.outputHeight > 0)
+                SetShotOutputResolution(config);
+            if (config.dlssModeSet)
+                m_ui.dlssMode = config.dlssMode;
+            if (config.lodPixelError > 0.f)
+                renderer.SetLodPixelError(config.lodPixelError);
+            if (config.adaptiveLodError >= 0)
+                renderer.SetAdaptiveLodError(config.adaptiveLodError != 0);
+            if (config.normalMapShading >= 0)
+                SetNormalMapShading(config.normalMapShading != 0);
+        }
         // Each capture point must converge on its own: the effective error is
-        // sticky, so without this an entry inherits the previous one's and the
-        // walk measures entry order as much as it measures the settings.
+        // sticky, so without this a position inherits the previous one's and
+        // the walk measures position order as much as it measures the settings.
         renderer.ResetAdaptiveLodError();
         // Pinned, never inherited: auto-exposure is a temporal feedback loop and
         // would drift the golden on its own.  LoadShotList requires the value.
         renderer.SetAutoExposure(false);
-        renderer.SetExposure(entry.exposure);
+        renderer.SetExposure(pos.exposure > 0.f ? pos.exposure : config.exposure);
         renderer.ResetSubframes();
         renderer.ResetDenoiser();
 
@@ -2860,9 +2938,9 @@ void RTXMGDemoApp::UpdateShotList()
         ++m_shotPhaseFrames;
 
         bool settled = false;
-        if (entry.settleFrames >= 0)
+        if (config.settleFrames >= 0)
         {
-            settled = m_shotPhaseFrames >= uint32_t(entry.settleFrames);
+            settled = m_shotPhaseFrames >= uint32_t(config.settleFrames);
         }
         else if (rtxmg::StreamingStats ss; renderer.GetClusterLodStreamingStats(ss))
         {
@@ -2886,24 +2964,32 @@ void RTXMGDemoApp::UpdateShotList()
             settled = true;
         }
 
-        if (settled || m_shotPhaseFrames >= entry.settleCap)
+        if (settled || m_shotPhaseFrames >= config.settleCap)
         {
             if (!settled)
-                log::warning("--shot-list '%s': residency still moving after %u frames "
+                log::warning("--shot-list '%s'/'%s': residency still moving after %u frames "
                              "(settleCap); capturing anyway.",
-                             entry.label.c_str(), m_shotPhaseFrames);
+                             config.name.c_str(), pos.label.c_str(), m_shotPhaseFrames);
             m_shotSettleFrames = m_shotPhaseFrames;
             // Time the settled configuration, not the streaming churn that got
             // here: the settle can outlast the sampler window on its own.
             stats::ResetTimingSamplers();
-            BeginShot();
+            if (config.shots.empty())
+            {
+                DumpPositionStats(pos, config);
+                AdvancePosition();
+            }
+            else
+            {
+                BeginShot();
+            }
         }
         break;
     }
 
     case ShotPhase::Accumulate:
         ++m_shotPhaseFrames;
-        if (m_shotPhaseFrames >= ShotAccumFrames(entry.shots[m_shotIndex]))
+        if (m_shotPhaseFrames >= ShotAccumFrames(config.shots[m_shotIndex]))
             m_shotPendingCapture = true;
         break;
 
@@ -2914,14 +3000,16 @@ void RTXMGDemoApp::UpdateShotList()
 
 void RTXMGDemoApp::BeginShot()
 {
-    const Shot& shot = m_shotEntries[m_shotEntryIndex].shots[m_shotIndex];
+    const ShotConfig&   config = m_shotConfigs[m_shotConfigIndex];
+    const ShotPosition& pos    = m_shotPositions[m_shotPositionIndex];
+    const Shot&         shot   = config.shots[m_shotIndex];
 
     // Both setters reset accumulation and the denoiser, so the shot accumulates
     // from scratch rather than inheriting the previous mode's history.
     GetRenderer().SetShadingMode(shot.shadingMode);
     GetRenderer().SetColorMode(shot.colorMode);
     GetRenderer().SetWireframe(shot.wireframe);
-    GetRenderer().SetExposure(shot.exposure);
+    GetRenderer().SetExposure(ShotExposure(shot, pos, config));
     // ResetSubframes is a no-op with the denoiser on, which would leave the
     // jitter phase dependent on the scene-load frame count.
     GetRenderer().ForceResetSubframes();
@@ -2932,31 +3020,54 @@ void RTXMGDemoApp::BeginShot()
 
 void RTXMGDemoApp::AdvanceShot()
 {
-    const ShotEntry& entry = m_shotEntries[m_shotEntryIndex];
+    const ShotConfig& config = m_shotConfigs[m_shotConfigIndex];
+    const ShotPosition& pos  = m_shotPositions[m_shotPositionIndex];
 
-    if (++m_shotIndex < entry.shots.size())
+    if (++m_shotIndex < config.shots.size())
     {
         BeginShot();
         return;
     }
 
-    DumpShotEntryStats(entry);
+    DumpPositionStats(pos, config);
+    AdvancePosition();
+}
 
-    if (++m_shotEntryIndex < m_shotEntries.size())
+void RTXMGDemoApp::AdvancePosition()
+{
+    if (++m_shotPositionIndex < m_shotPositions.size())
     {
         m_shotPhase = ShotPhase::Jump;
         return;
     }
 
+    if (++m_shotConfigIndex < m_shotConfigs.size())
+    {
+        m_shotPositionIndex = 0;
+        m_shotPhase          = ShotPhase::Jump;
+        return;
+    }
+
     m_shotPhase = ShotPhase::Done;
     log::info("--shot-list: all capture points written.");
-    glfwSetWindowShouldClose(GetDeviceManager()->GetWindow(), true);
+    if (m_shotInteractiveRun)
+    {
+        // Hand control back to the interactive session instead of exiting.
+        m_shotPositions.clear();
+        m_shotConfigs.clear();
+        m_shotInteractiveRun = false;
+        RestoreAfterShotList();
+    }
+    else
+    {
+        glfwSetWindowShouldClose(GetDeviceManager()->GetWindow(), true);
+    }
 }
 
-// Resize the window to the entry's output resolution.  DeviceManager reads the
+// Resize the window to the config's output resolution.  DeviceManager reads the
 // GLFW size every frame and resizes the swap chain itself, so setting it here is
 // enough; the settle that follows absorbs the DLSS re-init and the re-converge.
-void RTXMGDemoApp::SetShotOutputResolution(const ShotEntry& entry)
+void RTXMGDemoApp::SetShotOutputResolution(const ShotConfig& config)
 {
     GLFWwindow* window = GetDeviceManager()->GetWindow();
     if (!window)
@@ -2965,7 +3076,7 @@ void RTXMGDemoApp::SetShotOutputResolution(const ShotEntry& entry)
     // Drop out of fullscreen: its size comes from the display, and a list that
     // spans resolutions has to drive the size itself.
     if (glfwGetWindowMonitor(window))
-        glfwSetWindowMonitor(window, nullptr, 0, 0, entry.outputWidth, entry.outputHeight,
+        glfwSetWindowMonitor(window, nullptr, 0, 0, config.outputWidth, config.outputHeight,
                              GLFW_DONT_CARE);
 
     // Undecorated at the origin, so the client area is the full requested size:
@@ -2974,7 +3085,7 @@ void RTXMGDemoApp::SetShotOutputResolution(const ShotEntry& entry)
     // captured, so it does not matter that the window runs off-screen.
     glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_FALSE);
     glfwSetWindowPos(window, 0, 0);
-    glfwSetWindowSize(window, entry.outputWidth, entry.outputHeight);
+    glfwSetWindowSize(window, config.outputWidth, config.outputHeight);
 }
 
 // Video memory this process has resident on the local adapter, which is the
@@ -3020,18 +3131,21 @@ bool RTXMGDemoApp::QueryVideoMemory(uint64_t& usage, uint64_t& budget) const
 // location as whatever the last one happened to leave behind.  The 60-sample
 // timer window is entirely this location's by now (a pt shot accumulates 128
 // frames here), though min/max still span the run.
-void RTXMGDemoApp::DumpShotEntryStats(const ShotEntry& entry)
+void RTXMGDemoApp::DumpPositionStats(const ShotPosition& pos, const ShotConfig& config)
 {
     if (m_args.dumpStatsFile.empty())
         return;
 
-    // Carry only this entry's shots, and leave the cumulative frame log to the
-    // run-end dump rather than repeating it in every location's file.
+    // Carry only this position's shots, and leave the cumulative frame log to
+    // the run-end dump rather than repeating it in every location's file.
     std::vector<stats::ShotRecord>  allShots  = std::move(stats::shotRecords);
     std::vector<stats::FrameRecord> allFrames = std::move(stats::frameLog.records);
     stats::shotRecords.assign(allShots.begin() + m_shotRecordsAtEntryStart, allShots.end());
 
-    DumpStats((ShotStatsDir() / (entry.label + ".stats.json")).generic_string());
+    const std::string configName = config.name.empty() ? "default" : config.name;
+    const std::filesystem::path statsDir = ShotStatsDir() / configName;
+    std::filesystem::create_directories(statsDir);
+    DumpStats((statsDir / (pos.label + ".stats.json")).generic_string());
 
     stats::shotRecords     = std::move(allShots);
     stats::frameLog.records = std::move(allFrames);
@@ -3039,22 +3153,26 @@ void RTXMGDemoApp::DumpShotEntryStats(const ShotEntry& entry)
 
 void RTXMGDemoApp::CaptureShot(nvrhi::IFramebuffer* framebuffer)
 {
-    const ShotEntry& entry = m_shotEntries[m_shotEntryIndex];
-    const Shot&      shot  = entry.shots[m_shotIndex];
+    const ShotConfig&   config = m_shotConfigs[m_shotConfigIndex];
+    const ShotPosition& pos    = m_shotPositions[m_shotPositionIndex];
+    const Shot&          shot   = config.shots[m_shotIndex];
 
-    const std::filesystem::path out = ShotImageDir() / (entry.label + "." + shot.Tag() + ".png");
+    const std::string configName = config.name.empty() ? "default" : config.name;
+    const std::filesystem::path imageDir = ShotImageDir() / configName;
+    std::filesystem::create_directories(imageDir);
+    const std::filesystem::path out = imageDir / (pos.label + "." + shot.Tag() + ".png");
 
     nvrhi::ITexture* tex = framebuffer->getDesc().colorAttachments[0].texture;
     DoSaveScreenshot(tex, out.generic_string());
 
     stats::ShotRecord rec;
-    rec.label         = entry.label;
+    rec.label         = pos.label;
     rec.mode          = shot.Tag();
     rec.file          = out.filename().generic_string();
     rec.settleFrames  = m_shotSettleFrames;
     rec.accumFrames   = ShotAccumFrames(shot);
     rec.subframeIndex = GetRenderer().GetSubframeIndex();
-    rec.exposure      = shot.exposure;
+    rec.exposure      = ShotExposure(shot, pos, config);
     auto percentOf = [](uint64_t used, uint64_t budget)
     { return budget ? float(double(used) / double(budget) * 100.0) : 0.f; };
 
@@ -3075,7 +3193,11 @@ void RTXMGDemoApp::CaptureShot(nvrhi::IFramebuffer* framebuffer)
     rec.totalTriangles   = clc.totalTriangles;
     rec.renderedClusters = clc.numRenderedClusters;
 
+#if DONUT_WITH_STREAMLINE
     rec.dlssMode              = DlssModeName(m_ui.dlssMode);
+#else
+    rec.dlssMode              = "off";
+#endif
     rec.renderWidth           = stats::clusterAccelSamplers.renderSize.x;
     rec.renderHeight          = stats::clusterAccelSamplers.renderSize.y;
     rec.outputWidth           = m_displaySize.x;
@@ -3383,6 +3505,65 @@ void RTXMGDemoApp::DoSaveScreenshot(nvrhi::ITexture* framebufferTexture, std::st
         donut::log::message(donut::log::Severity::Info, "Screenshot saved: %s", std::filesystem::absolute(filepath).string().c_str());
     }
 }
+
+#if RTXMG_DEV_FEATURES
+// Writes a mapped H x W texture as an (H, W, channels) .npy array.
+static void WriteTextureNpy(const fs::path& path, const char* descr, uint32_t channels, uint32_t bytesPerTexel,
+                            const nvrhi::TextureDesc& desc, const uint8_t* data, size_t rowPitch)
+{
+    std::string header = std::string("{'descr': '") + descr + "', 'fortran_order': False, 'shape': (" +
+                         std::to_string(desc.height) + ", " + std::to_string(desc.width) + ", " +
+                         std::to_string(channels) + "), }";
+    // Magic (6) + version (2) + length (2) + header must end on a 64-byte boundary.
+    header.append(63 - (10 + header.size()) % 64, ' ');
+    header.push_back('\n');
+
+    std::ofstream f(path, std::ios::binary);
+    const uint16_t headerLen = uint16_t(header.size());
+    f.write("\x93NUMPY\x01\x00", 8);
+    f.write(reinterpret_cast<const char*>(&headerLen), 2);
+    f.write(header.data(), header.size());
+    for (uint32_t y = 0; y < desc.height; ++y)
+        f.write(reinterpret_cast<const char*>(data + y * rowPitch), size_t(desc.width) * bytesPerTexel);
+}
+
+void RTXMGDemoApp::DumpAnimFrame(uint32_t frame)
+{
+    struct Dump { RTXMGRenderer::Output output; const char* prefix; const char* descr; uint32_t channels, texelBytes; };
+    const Dump dumps[] = {
+        { RTXMGRenderer::Output::MotionVectors, "mv",  "<f2", 2, 4 },
+        { RTXMGRenderer::Output::Albedo,        "alb", "|u1", 4, 4 },
+    };
+
+    std::error_code ec;
+    fs::create_directories(m_args.animDumpDir, ec);
+
+    for (const Dump& d : dumps)
+    {
+        nvrhi::ITexture* src = GetRenderer().GetOutputTexture(d.output);
+        nvrhi::TextureDesc desc = src->getDesc();
+        desc.isRenderTarget = false;
+        desc.isUAV          = false;
+        desc.initialState   = nvrhi::ResourceStates::CopyDest;
+        desc.keepInitialState = true;
+        nvrhi::StagingTextureHandle staging = GetDevice()->createStagingTexture(desc, nvrhi::CpuAccessMode::Read);
+
+        m_commandList->open();
+        m_commandList->copyTexture(staging, nvrhi::TextureSlice(), src, nvrhi::TextureSlice());
+        m_commandList->close();
+        GetDevice()->executeCommandList(m_commandList);
+        GetDevice()->waitForIdle();
+
+        size_t rowPitch = 0;
+        const auto* data = static_cast<const uint8_t*>(
+            GetDevice()->mapStagingTexture(staging, nvrhi::TextureSlice(), nvrhi::CpuAccessMode::Read, &rowPitch));
+        char name[32];
+        std::snprintf(name, std::size(name), "%s_%04u.npy", d.prefix, frame);
+        WriteTextureNpy(fs::path(m_args.animDumpDir) / name, d.descr, d.channels, d.texelBytes, desc, data, rowPitch);
+        GetDevice()->unmapStagingTexture(staging);
+    }
+}
+#endif
 
 void RTXMGDemoApp::DumpDebugBuffer()
 {

@@ -62,6 +62,19 @@ struct MaterialTextureSample
 #define NV_SHADER_EXTN_REGISTER_SPACE space0
 #include "nvHLSLExtns.h"
 
+#if DONUT_CLUSTER_API_DXR
+uint32_t GetClusterID()
+{
+    return ClusterID();
+}
+
+#define CLUSTER_LOD_AS_POSITION_FETCH 1
+float3x3 GetHitTriangleObjectPositions()
+{
+    const BuiltInTrianglePositions p = TriangleObjectPositions();
+    return float3x3(p.p0, p.p1, p.p2);
+}
+#else
 uint32_t GetClusterID()
 {
     return NvRtGetClusterID();
@@ -74,6 +87,7 @@ float3x3 GetHitTriangleObjectPositions()
 {
     return NvRtTriangleObjectPositions();
 }
+#endif
 
 #elif defined(TARGET_VULKAN)
 
@@ -1309,7 +1323,10 @@ uint TimeDiff(uint startTime, uint endTime)
 [shader("raygeneration")]void RayGen()
 {
 #if defined(TARGET_D3D12)
-    uint startTime = NvGetSpecial(NV_SPECIALOP_GLOBAL_TIMER_LO);
+    // The timer goes through the NVAPI extension UAV, which is null without NVAPI.
+    uint startTime = 0;
+    if (g_RenderParams.enableTimeView)
+        startTime = NvGetSpecial(NV_SPECIALOP_GLOBAL_TIMER_LO);
 #endif
     DUMP_FLOAT4(1, float4(0, 0, 0, 1)); // Clear debug buffer
     DUMP_FLOAT4(2, float4(0, 0, 0, 1)); // Clear debug buffer

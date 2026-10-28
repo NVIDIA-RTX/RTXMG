@@ -52,6 +52,7 @@
 #include "rtxmg/cluster_lod/shader_registers.h"
 #include "rtxmg/cluster_lod/blas_build_params.h"
 #include <nvrhi/nvrhiHLSL.h>
+#include "rtxmg/utils/wave_size.hlsli"
 
 ////////////////////////////////////////////
 
@@ -70,6 +71,7 @@ RWStructuredBuffer<uint64_t>                         u_BlasClasAddrs       : CLO
 
 groupshared uint s_clusterOffset;  // pool-subrange cursor; each wave reserves a block
 
+RTXMG_WAVE_SIZE_32
 [numthreads(shaderio::kBlasCachingSetupBuildThreads, 1, 1)]
 void main(uint3 groupID : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 {
@@ -107,7 +109,7 @@ void main(uint3 groupID : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         // Unlike there, clusterCount is set to the known total up front — the
         // gather below appends without incrementing it.
         u_BlasArgs[buildOffset].clusterCount     = cachedBlasClustersCount;
-        u_BlasArgs[buildOffset].reserved         = 0;
+        u_BlasArgs[buildOffset].clusterAddressStride = 8;
         u_BlasArgs[buildOffset].clusterAddresses =
             g_Params.blasClasAddressesBaseVA + uint64_t(referencesOffset) * uint64_t(8);
 

@@ -34,6 +34,7 @@
 #include "rtxmg/utils/alignment.h"               // for rtxmg::align_up
 #include "rtxmg/utils/buffer.h"                  // for RTXMGBuffer<T>
 #include "rtxmg/utils/buffer_sub_allocator.h"    // for rtxmg::BufferSubAllocator + BufferSubAllocation
+#include "rtxmg/utils/cluster_operation.h"       // for ClusterOperationSizesBuffer
 #include "rtxmg/utils/id_pool.h"                 // for rtxmg::IDPool
 
 
@@ -567,7 +568,7 @@ private:
     // Per-region typed CLAS build/move arrays, each bound at its own slot.
     RTXMGBuffer<shaderio::ClasBuildInfo> m_newClasBuildsBuffer;
     RTXMGBuffer<uint64_t>                m_newClasAddressesBuffer;
-    RTXMGBuffer<uint32_t>                m_newClasSizesBuffer;
+    ClusterOperationSizesBuffer          m_newClasSizesBuffer;
     RTXMGBuffer<uint32_t>                m_newClasResidentIDsBuffer;
     RTXMGBuffer<uint32_t>                m_newClasGeometryIndicesBuffer;
     RTXMGBuffer<uint64_t>                m_moveClasDstAddressesBuffer;

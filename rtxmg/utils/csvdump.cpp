@@ -10,6 +10,7 @@
  * its affiliates is strictly prohibited.
  */
 
+#include <cmath>
 #include <iomanip>
 #include <fstream>
 
@@ -35,7 +36,7 @@ void WriteTexToCSV(nvrhi::ICommandList* commandList, nvrhi::ITexture* tex, char 
         for (uint32_t x = 0; x < desc.width; x++)
         {
             float z = pData[y * rowPitch / sizeof(float) + x];
-            if (isinf(z))
+            if (std::isinf(z))
                 z = -1.0f;
             debugDump << std::setw(8) << std::right << z;
             if (x < desc.width - 1)

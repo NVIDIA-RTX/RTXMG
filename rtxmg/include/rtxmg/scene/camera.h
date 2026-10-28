@@ -53,6 +53,8 @@ public:
     std::array<float3, 3> const& GetBasis();
 
     void Print() const;
+    // Same syntax Set() parses: "[eye][lookat][up]fovY".
+    std::string ToString() const;
 
     float3 GetEye() const { return m_eye; }
     float3 GetLookat() const { return m_lookat; }
@@ -78,7 +80,9 @@ public:
     void SetNear(float near);
     void SetFar(float far);
 
-    void Set(std::string const& camc_string);
+    // Parses "[eye][lookat][up]fovY"; leaves the camera untouched and returns
+    // false on anything malformed or degenerate.
+    bool Set(std::string const& camc_string);
 
 private:
     void ComputeBasis(float3& u, float3& v, float3& w) const;

@@ -28,8 +28,18 @@ struct TessellationCounters
     uint32_t desiredTriangles;
     uint32_t desiredClasBlocks;
 
+    // Scale on the tessellation rates for this build, from update_tess_rate.hlsl,
+    // and whether it differs from the previous build's.
+    float rateScale;
+    uint32_t rateAdjusted;
+
+    // Scale each budget asks for on its own; rateScale is the smallest.
+    float clusterRateScale;
+    float clasRateScale;
+    float vertexRateScale;
+
     // Pad for vulkan minStorageBufferOffsetAlignment = 16
-    uint32_t pad[3];
+    uint32_t pad[2];
 
 #ifdef __cplusplus
     size_t DesiredClasBytes() const { return size_t(desiredClasBlocks) * nvrhi::rt::cluster::kClasByteAlignment; }

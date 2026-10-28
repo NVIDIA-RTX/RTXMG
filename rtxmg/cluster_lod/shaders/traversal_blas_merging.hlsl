@@ -58,9 +58,11 @@ uint GetCachedBlasLodLevel(uint geometryID)
 }
 
 #include "stream_age_groups.hlsli"
+#include "rtxmg/utils/wave_size.hlsli"
 
 ////////////////////////////////////////////
 
+RTXMG_WAVE_SIZE_32
 [numthreads(shaderio::kTraversalBlasMergingThreads, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID)
 {

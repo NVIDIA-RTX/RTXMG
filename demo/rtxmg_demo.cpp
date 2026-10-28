@@ -110,6 +110,7 @@ static LONG WINAPI UnhandledExceptionHandler(EXCEPTION_POINTERS* pExceptionInfo)
 }
 #endif // _WIN32
 
+#ifdef _WIN32
 extern "C" {
 
 #ifdef DONUT_D3D_AGILITY_SDK_ENABLED
@@ -119,6 +120,7 @@ extern "C" {
 
     _declspec(dllexport) DWORD NvOptimusEnablement = 0x0000001;
 }
+#endif
 
 #include "rtxmg_demo_app.h"
 #include "gui.h"
@@ -185,12 +187,8 @@ int main(int argc, const char** argv)
 
     app::DeviceManager* deviceManager = app::DeviceManager::Create(api);
 
-#if defined(_M_ARM64) || defined(__aarch64__)
-    const char* arch = "arm64";
-#else
-    const char* arch = "x64";
-#endif
-    std::string title = "RTX Mega Geometry " RTXMG_VERSION + std::string(api == nvrhi::GraphicsAPI::D3D12 ? " (D3D12 " : " (VULKAN ") + arch + ")";
+    // RTXMGDemoApp appends the API, which on D3D12 is only known once the device exists.
+    std::string title = "RTX Mega Geometry " RTXMG_VERSION;
 
     try 
     {

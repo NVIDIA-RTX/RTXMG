@@ -12,6 +12,7 @@
 #pragma once
 
 #ifdef __cplusplus
+#include <cstddef>
 #include <cstdint>
 #endif
 

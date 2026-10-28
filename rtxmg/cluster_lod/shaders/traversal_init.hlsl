@@ -55,6 +55,7 @@
 #include "feature_gates.hlsli"
 #include "rtxmg/cluster_lod/shaders/traversal_common.hlsli"
 #include "rtxmg/cluster_lod/shaders/culling.hlsli"  // frustum culling: IntersectFrustum
+#include "rtxmg/utils/wave_size.hlsli"
 
 ////////////////////////////////////////////
 
@@ -78,6 +79,7 @@ SamplerState     s_ClusterLodHiZSampler        : register(s0, space1);
 
 ////////////////////////////////////////////
 
+RTXMG_WAVE_SIZE_32
 [numthreads(shaderio::kTraversalInitThreads, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID)
 {

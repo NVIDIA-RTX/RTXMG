@@ -31,6 +31,7 @@
 #include "rtxmg/cluster_lod/pass.h"
 #include "rtxmg/cluster_lod/resources.h"
 #include "rtxmg/utils/buffer.h"
+#include "rtxmg/utils/cluster_operation.h"
 
 struct BlasBuildParams;
 
@@ -115,11 +116,13 @@ public:
 
     // Per-build BLAS byte sizes (entries [0..blasBuildCounter) are valid after
     // Execute).  Summed host-side for the Profiler "Streaming" tab's BLAS memory.
-    RTXMGBuffer<uint32_t>& GetBlasSizesTyped() { return m_blasSizes; }
+    ClusterOperationSizesBuffer& GetBlasSizesTyped() { return m_blasSizes; }
 
     // Build args and address/size arrays, but NOT m_blasBuffer — the BLAS
     // storage is its own VRAM bucket.  Feeds Cluster LOD Metadata.
     uint64_t GetMetadataBytes() const;
+    // The BLAS storage at its worst-case size, of which only part is built each frame.
+    uint64_t GetBlasBufferBytes() const { return m_blasBuffer.GetVramBytes(); }
 
 private:
     void CreatePipelines(donut::engine::ShaderFactory* shaderFactory,
@@ -146,7 +149,7 @@ private:
     // hand one of those dangling VAs to the BLAS builder (device-removed).
     bool                                          m_blasClasAddrsNeedsClear = true;
     RTXMGBuffer<nvrhi::GpuVirtualAddress>         m_blasAddresses;  // output: per-build BLAS VA
-    RTXMGBuffer<uint32_t>                         m_blasSizes;      // output: per-build BLAS size
+    ClusterOperationSizesBuffer                   m_blasSizes;     // output: per-build BLAS size
     RTXMGBuffer<uint32_t>                         m_perGeomSeen;    // render-stats: per-geom low-detail/cached unique dedup
     RTXMGBuffer<uint8_t>                          m_blasBuffer;     // BLAS storage
 

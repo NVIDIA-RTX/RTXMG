@@ -54,6 +54,8 @@ struct TopologyMap
 
     void InitDeviceData(std::shared_ptr<donut::engine::DescriptorTableManager> descriptorTable, nvrhi::ICommandList* commandList, bool keepHostData = true);
 
+    uint64_t GetVramBytes() const;
+
     // statistics
 
     struct SubdivisionPlanStats

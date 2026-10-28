@@ -53,19 +53,20 @@ void SafeSpawnPoint(
 
     // transform object space position.
     // add in translation last to reduce world space error.
-    precise float3 wldPosition;
-    wldPosition.x = o2w._m03 +
+    // Built from scalars: SM 6.9+ DXC cannot compile component writes into a precise vector.
+    precise float wldX = o2w._m03 +
         mad( o2w._m00, objPosition.x,
             mad( o2w._m01, objPosition.y,
                 mul( o2w._m02, objPosition.z ) ) );
-    wldPosition.y = o2w._m13 +
+    precise float wldY = o2w._m13 +
         mad( o2w._m10, objPosition.x,
             mad( o2w._m11, objPosition.y,
                 mul( o2w._m12, objPosition.z ) ) );
-    wldPosition.z = o2w._m23 +
+    precise float wldZ = o2w._m23 +
         mad( o2w._m20, objPosition.x,
             mad( o2w._m21, objPosition.y,
                 mul( o2w._m22, objPosition.z ) ) );
+    precise float3 wldPosition = float3( wldX, wldY, wldZ );
 
     // transform normal to world - space using
     // inverse transpose matrix

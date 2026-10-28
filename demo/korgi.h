@@ -95,8 +95,10 @@ namespace korgi
 #define KORGI_KNOB_CALLBACK(page, control, callback, ...) static korgi::Knob KORGI_CAT(s_KorgKnob_, __LINE__) (page, korgi::Control::##control, nullptr, callback, ##__VA_ARGS__ );
 #else
 #define KORGI_TOGGLE(...)
+#define KORGI_BUTTON_CALLBACK(...)
 #define KORGI_INT_TOGGLE(...)
 #define KORGI_KNOB(...)
+#define KORGI_KNOB_CALLBACK(...)
 #endif
 
     enum class ButtonMode

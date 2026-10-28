@@ -83,6 +83,7 @@ void ZRenderer::BuildPipeline(nvrhi::IDevice* device)
 
     pipelineDesc.maxPayloadSize = sizeof(ZRayPayload);
     pipelineDesc.maxRecursionDepth = 2;
+    pipelineDesc.allowClusters = true;
 
     m_rayPipeline = device->createRayTracingPipeline(pipelineDesc);
 

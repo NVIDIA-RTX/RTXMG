@@ -28,6 +28,7 @@
 #include "blit_params.h"
 #include "motion_vectors_params.h"
 #include "render_targets.h"
+#include "cluster_lod_budgets.h"
 
 #include "rtxmg/cluster_lod/adaptive_lod_error.h"
 #include "rtxmg/cluster_lod/blas_pass.h"
@@ -65,6 +66,8 @@ public:
     {
         RenderParams& params;
         nvrhi::IDevice* device;
+        // Path trace with the DXR cluster intrinsics even when NVAPI builds the clusters.
+        bool forceDxrClusterIntrinsics = false;
     };
 
     enum class OutputTexture : uint32_t
@@ -307,6 +310,7 @@ public:
     // The pixel error the last traversal actually used (== m_lodPixelError
     // unless the adaptive path raised it).
     float GetEffectiveLodPixelError() const { return m_adaptiveLodErrorController.GetEffectiveError(); }
+    float GetAdaptiveLodLoad() const        { return m_adaptiveLodErrorController.GetSmoothedLoadFactor(); }
 
     TonemapOperator GetTonemapOperator() const { return m_tonemapOperator; }
     void SetTonemapOperator(TonemapOperator tonemapOperator)
@@ -356,7 +360,8 @@ public:
     }
 
     void SetTimeView(bool timeView);
-    bool GetTimeView() const { return m_params.enableTimeView; }
+    bool GetTimeView() const { return m_params.enableTimeView && m_hlslExtensionsSupported; }
+    bool IsTimeViewSupported() const { return m_hlslExtensionsSupported; }
 
     // Warn/log-once state is per scene, not per process: after a scene switch
     // the same misconfiguration deserves the same warning.
@@ -408,12 +413,13 @@ public:
     }
 
     // Must be called while the command list is still open (after RTXMGScene::FinishedLoading).
-    void SceneFinishedLoading(std::shared_ptr<RTXMGScene> scene, nvrhi::ICommandList* commandList);
+    void SceneFinishedLoading(std::shared_ptr<RTXMGScene> scene, const ClusterLodBudgets& budgets,
+                              nvrhi::ICommandList* commandList);
 
     // Rebuild the accel-structure resources for the currently loaded scene
     // without reloading it, re-streaming from scratch — how a streaming-budget
     // change is applied.  Needs an open command list and an idle GPU.
-    void ReinitAccelStructs(nvrhi::ICommandList* commandList);
+    void ReinitAccelStructs(const ClusterLodBudgets& budgets, nvrhi::ICommandList* commandList);
 
     // Must be set BEFORE SceneFinishedLoading; CreateAccelStructs branches on it.
     void SetUseStreaming(bool useStreaming) { m_useStreaming = useStreaming; }
@@ -456,32 +462,17 @@ public:
     // Soft-cull LoD bias (culledErrorScale; clamped >= 1 when applied each frame).
     void SetCulledErrorScale(float f)         { m_culledErrorScale = f; }
     float GetCulledErrorScale() const         { return m_culledErrorScale; }
-    // Optional CLAS-pool cap (MB) for the compaction allocator. 0 = default.
-    void SetClasPoolOverrideMB(uint32_t mb)   { m_clasPoolOverrideMB = mb; }
-    // Streaming request throttle. 0 means use StreamingConfig's default.
-    void SetMaxFrameLoadRequests(uint32_t maxRequests) { m_maxFrameLoadRequests = maxRequests; }
-
-    // Streaming pool-budget overrides (sidebar sliders); 0 = StreamingConfig
-    // default.  Every budget sizes GPU pools in CreateAccelStructs, so a change
-    // needs an accel rebuild to take effect.
-    void     SetMaxResidentGroups(uint32_t n) { m_maxResidentGroupsOverride = n; }
-    void     SetMaxGeometryMB(uint32_t mb)    { m_maxGeometryMBOverride = mb; }
-    void     SetGeometryBlockMB(uint32_t mb)  { m_geometryBlockMBOverride = mb; }
-    void     SetMaxClasMB(uint32_t mb)        { m_maxClasMBOverride = mb; }
-    void     SetMaxBlasCachingMB(uint32_t mb) { m_maxBlasCachingMBOverride = mb; }
     // Mantissa bits the CLAS builder drops from vertex positions; both cluster-LoD
     // paths raise it to the bake's compressionPosDropBits on a compressed scene.
     void     SetClasPositionTruncateBits(uint32_t b) { m_clasPositionTruncateBits = b; }
     uint32_t GetClasPositionTruncateBits() const     { return m_clasPositionTruncateBits; }
-    // Per-frame render-cluster budget exponent (1u << bits), applied at the next
-    // accel rebuild (ReinitAccelStructs).
-    void     SetRenderClusterBits(uint32_t b) { m_clusterLodRenderClusterBits = b; }
-    uint32_t GetRenderClusterBits() const     { return m_clusterLodRenderClusterBits; }
+    // Render-cluster budget exponent the accel structs were built with.
+    uint32_t GetRenderClusterBits() const     { return m_clodBudgets.renderClusterBits; }
 
     // BLAS-effectiveness stats for the Profiler "Streaming" tab, async-read each
     // frame after the BLAS build (1-frame lag).
     const shaderio::SceneBuildingCounters& GetClusterLodCounters() const { return m_clusterLodSystem.GetCounters(); }
-    uint32_t GetClusterLodMaxRenderClusters() const { return 1u << m_clusterLodRenderClusterBits; }
+    uint32_t GetClusterLodMaxRenderClusters() const { return 1u << m_clodBudgets.renderClusterBits; }
 
     // The unique/total triangle tallies atomically accumulate into the
     // descriptor-table-bound counters buffer, so they are only valid when the
@@ -489,6 +480,7 @@ public:
     void SetAtomicInt64OnHeapSupported(bool b) { m_atomicInt64OnHeapSupported = b; }
     bool GetAtomicInt64OnHeapSupported() const { return m_atomicInt64OnHeapSupported; }
     uint64_t GetClusterLodBlasActualBytes() const { return m_clusterLodSystem.GetBlasActualBytes(); }
+    uint64_t GetClusterLodBlasBufferBytes() const { return m_clusterLodSystem.GetBlasBufferBytes(); }
     uint64_t GetClusterLodMetadataBytes() const { return m_clusterLodSystem.GetMetadataBytes(); }
 
     // Effective (post-init, defaults-resolved) streaming config for the sidebar
@@ -581,8 +573,12 @@ public:
     // z-prepass depth and its HiZ chain, and the per-pixel readback buffers.  Only
     // what this renderer owns -- DLSS's own targets are internal to Streamline.
     uint64_t GetRenderTargetBytes() const;
-    // Envmap bytes, split out because the texture budget does not cover it.
+    // Envmap texture plus its importance-sampling tables, split out because the
+    // texture budget does not cover it.
     uint64_t GetEnvMapBytes() const;
+    // TLAS storage and its instance-desc buffer.
+    uint64_t GetTlasBytes() const;
+    uint64_t GetClusterTessWorkingBytes() const;
 
     ZBuffer* GetZBuffer() { return m_zbuffer.get(); }
     const ZBuffer* GetZBuffer() const { return m_zbuffer.get(); }
@@ -726,16 +722,9 @@ private:
     // HiZ occlusion test inside the cull (z-prepass depth pyramid).
     bool                                  m_useHizOcclusion = true;
     float                                 m_culledErrorScale = 2.0f;
-    uint32_t                              m_clasPoolOverrideMB = 0;
-    uint32_t                              m_maxFrameLoadRequests = 0;
-    // Sidebar budget-slider overrides (0 = StreamingConfig default).
-    uint32_t                              m_maxResidentGroupsOverride = 0;
-    uint32_t                              m_maxGeometryMBOverride = 0;
-    uint32_t                              m_geometryBlockMBOverride = 0;
-    uint32_t                              m_maxClasMBOverride = 0;
-    uint32_t                              m_maxBlasCachingMBOverride = 0;
+    // The budgets the accel structs were last built with; the app owns the requested ones.
+    ClusterLodBudgets                     m_clodBudgets;
     uint32_t                              m_clasPositionTruncateBits = 0;
-    uint32_t                              m_clusterLodRenderClusterBits = ClusterLodPass::kDefaultRenderClusterBits;
     bool                                  m_debugClusterLod      = false;
     bool                                  m_stripResidentData    = true;
     bool                                  m_stripResidentPositions = true;
@@ -809,6 +798,8 @@ private:
     bool m_enableVertexNormals = false;
     bool m_enableClusterLodVertexNormals = false;
     bool m_enableClusterLodNormalMaps = false;
+    // NVAPI HLSL extensions; time view reads the GPU timer through them.
+    bool m_hlslExtensionsSupported = false;
     std::unique_ptr<ZBuffer> m_zbuffer;
     // Owned alongside the ZBuffer and the TLAS it traces, so the prepass cannot
     // outlive memory this renderer retires.

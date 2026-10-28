@@ -24,6 +24,7 @@
 
 #include "implot.h"
 #include "rtxmg_demo.h"
+#include "shot_list.h"
 
 #include "rtxmg/profiler/gui.h"
 
@@ -192,6 +193,7 @@ struct UIData
     bool showBakeConfigWindow      = false;
     bool showBakeReportWindow      = false;
     bool showGridInstancingWindow  = false;
+    bool showShotListWindow    = false;
     bool focusBakeReport       = false;
     bool refreshBakeConfig     = false; // force re-init of baseline on next open
     
@@ -201,14 +203,12 @@ struct UIData
     std::string envmapFilepath = "";
 
     // DLSS
-#if DONUT_WITH_STREAMLINE
     using StreamlineInterface = donut::app::StreamlineInterface;
     StreamlineInterface::DLSSMode dlssMode = StreamlineInterface::DLSSMode::eMaxQuality;
     bool dlssUseLodBiasOverride = false;
     float dlssLodBiasOverride = 0.f;
     StreamlineInterface::DLSSPreset dlssPreset = StreamlineInterface::DLSSPreset::eDefault;
     StreamlineInterface::DLSSRRPreset dlssRRPreset = StreamlineInterface::DLSSRRPreset::eDefault;
-#endif
 };
 
 class UserInterface : public donut::app::ImGui_Renderer
@@ -290,7 +290,9 @@ private:
     // Live budget state, and the staged copy of it that Apply commits.
     StagedBudgets LiveBudgets();
     void SyncStagedBudgets();
-    void ApplyStagedPoolBudgets();
+    // Commits the staged pool budgets; reallocate re-streams the cluster-LoD
+    // pools now, which a scene reload makes redundant.
+    void ApplyStagedPoolBudgets(bool reallocate);
     // Total the proposed plot would show for `s`.  Also the 90%-of-VRAM ceiling
     // test, so a field can refuse an edit that would not fit.
     uint64_t ProposedBytes(const StagedBudgets& s);
@@ -310,6 +312,7 @@ private:
     void BuildBakeConfigWindow();
     void BuildBakeReportWindow();
     void BuildGridInstancingWindow();
+    void BuildShotListWindow();
 
     bool BuildTimeLineEditor(TimeLineEditorState& state, float2 size);
 
@@ -395,4 +398,22 @@ private:
     float    m_stagedGridGap        = 1.0f;
     bool     m_stagedGridRandomize  = true;
     bool     m_gridInstancingWindowOpen = false;
+
+    // Camera section's editable camera string.
+    std::string m_cameraStringBuf;
+    bool        m_cameraStringEdited  = false;
+    bool        m_cameraStringInvalid = false;
+
+    // Shot List window state.
+    bool                       m_shotListWindowOpen = false;
+    std::string                m_shotListPathBuf;         // ImGui::InputText target
+    std::string                m_shotListDefaultScene;    // scene the default list was last looked up for
+    std::filesystem::path      m_shotListLoadedPath;
+    std::vector<ShotPosition>  m_shotListPositions;
+    std::vector<ShotConfig>    m_shotListConfigs;
+    std::vector<bool>          m_shotListConfigSelected;  // which configs "Run" includes
+    int                        m_shotListSelectedPos = -1;
+    std::string                m_shotListNewLabelBuf;
+    std::string                m_shotListStatus;          // last load/save result
+    size_t                     m_shotListRunningConfigCount = 0; // for the progress display
 };

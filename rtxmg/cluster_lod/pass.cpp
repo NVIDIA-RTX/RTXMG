@@ -180,17 +180,17 @@ void ClusterLodPass::Init(
 
 uint64_t ClusterLodPass::GetMetadataBytes() const
 {
-    return m_counters.GetBytes()
-         + m_instanceBuildInfos.GetBytes()
-         + m_instanceBlasAddrs.GetBytes()
-         + m_traversalNodeQ.GetBytes()
-         + m_traversalGroupQ.GetBytes()
-         + m_renderClusterInfos.GetBytes()
-         + m_geometryBuildInfos.GetBytes()
-         + m_geometryHistograms.GetBytes()
-         + m_instanceVisibility.GetBytes()
-         + m_perInstanceTriangles.GetBytes()
-         + m_uniqueSeenClusters.GetBytes();
+    return m_counters.GetVramBytes()
+         + m_instanceBuildInfos.GetVramBytes()
+         + m_instanceBlasAddrs.GetVramBytes()
+         + m_traversalNodeQ.GetVramBytes()
+         + m_traversalGroupQ.GetVramBytes()
+         + m_renderClusterInfos.GetVramBytes()
+         + m_geometryBuildInfos.GetVramBytes()
+         + m_geometryHistograms.GetVramBytes()
+         + m_instanceVisibility.GetVramBytes()
+         + m_perInstanceTriangles.GetVramBytes()
+         + m_uniqueSeenClusters.GetVramBytes();
 }
 
 // ---------------------------------------------------------------------------

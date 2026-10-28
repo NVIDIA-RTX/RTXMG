@@ -59,6 +59,7 @@
 // which is why the skip additionally requires useHardCull at runtime.
 #if CLUSTER_LOD_HIZ_OCCLUSION
 #include "culling.hlsli"
+#include "rtxmg/utils/wave_size.hlsli"
 Texture2D<float> t_ClusterLodHiZ[HIZ_MAX_LODS] : register(t0, space1);
 SamplerState     s_ClusterLodHiZSampler        : register(s0, space1);
 #endif
@@ -249,6 +250,7 @@ void MainBody(uint3 gid)
     }
 }
 
+RTXMG_WAVE_SIZE_32
 [numthreads(shaderio::kTraversalGroupsThreads, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID)
 {

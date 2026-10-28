@@ -77,6 +77,7 @@
 #pragma pack_matrix(row_major)
 
 #include "rtxmg/cluster_lod/shaderio.h"
+#include "rtxmg/utils/wave_size.hlsli"
 
 ////////////////////////////////////////////
 
@@ -194,6 +195,7 @@ uint WavePrefixMaxExclusive(uint v)
 
 ////////////////////////////////////////////
 
+RTXMG_WAVE_SIZE_32
 [numthreads(shaderio::kStreamAllocatorBuildFreegapsThreads, 1, 1)]
 void main(uint3 gid    : SV_DispatchThreadID,
           uint3 groupID: SV_GroupID,

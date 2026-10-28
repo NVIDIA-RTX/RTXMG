@@ -13,6 +13,7 @@
 
 #include "rtxmg/subdivision/subdivision_surface.h"
 
+#include "rtxmg/utils/alignment.h"
 #include "rtxmg/utils/buffer.h"
 #include "rtxmg/subdivision/topology_cache.h"
 #include "rtxmg/subdivision/topology_map.h"
@@ -398,27 +399,22 @@ SubdivisionSurface::SubdivisionSurface(TopologyCache& topologyCache,
         // Includes the 0th frame
         size_t nframes = keyFrameShapes.size() + 1;
 
-        m_positionsPrevBuffer = CreateAndUploadBuffer<float3>(m_shape->verts, "SubdPosedPositions", commandList);
-
-        m_positionKeyframeBuffers.resize(nframes);
+        m_numKeyframes = uint32_t(nframes);
         m_aabbKeyframes.resize(nframes);
 
-        m_positionKeyframeBuffers[0] = CreateAndUploadBuffer<float3>(
-            m_shape->verts, "SubdKeyFramePosition0", commandList);
+        const size_t frameBytes = m_shape->verts.size() * sizeof(float3);
+        m_positionKeyframes = CreateBuffer(nframes * m_shape->verts.size(), sizeof(float3),
+                                           "SubdKeyFramePositions", commandList->getDevice());
+        commandList->writeBuffer(m_positionKeyframes, m_shape->verts.data(), frameBytes, 0);
         m_aabbKeyframes[0] = m_shape->aabb;
 
-        // starts 1 indexed
-        uint32_t frameIndex = 1;
-        for (auto& keyFrameShape : keyFrameShapes)
+        for (size_t frameIndex = 1; frameIndex < nframes; ++frameIndex)
         {
-            char debugName[50];
-            std::snprintf(debugName, std::size(debugName), "SubdKeyFramePosition%d",
-                frameIndex);
-            m_positionKeyframeBuffers[frameIndex] =
-                CreateAndUploadBuffer<float3>(keyFrameShape->verts, debugName, commandList);
-            m_aabbKeyframes[frameIndex] = keyFrameShape->aabb;
-
-            frameIndex++;
+            const Shape& keyFrameShape = *keyFrameShapes[frameIndex - 1];
+            assert(keyFrameShape.verts.size() == m_shape->verts.size());
+            commandList->writeBuffer(m_positionKeyframes, keyFrameShape.verts.data(), frameBytes,
+                                     frameIndex * frameBytes);
+            m_aabbKeyframes[frameIndex] = keyFrameShape.aabb;
         }
     }
 
@@ -426,10 +422,6 @@ SubdivisionSurface::SubdivisionSurface(TopologyCache& topologyCache,
     m_vertexControlPointIndicesDescriptor = descriptorTable->CreateDescriptorHandle(nvrhi::BindingSetItem::StructuredBuffer_SRV(0, m_vertexDeviceData.controlPointIndices));
     
     m_positionsDescriptor = descriptorTable->CreateDescriptorHandle(nvrhi::BindingSetItem::StructuredBuffer_SRV(0, m_positionsBuffer));
-    if (m_positionsPrevBuffer)
-    {
-        m_positionsPrevDescriptor = descriptorTable->CreateDescriptorHandle(nvrhi::BindingSetItem::StructuredBuffer_SRV(0, m_positionsPrevBuffer));
-    }
 
 }
 
@@ -461,6 +453,18 @@ void SubdivisionSurface::BuildSurfaceToMaterialIndex(
 uint32_t SubdivisionSurface::SurfaceCount() const
 {
     return m_surfaceCount;
+}
+
+uint64_t SubdivisionSurface::GetVramBytes() const
+{
+    uint64_t bytes = 0;
+    for (const SurfaceTableDeviceData* d : { &m_vertexDeviceData, &m_texcoordDeviceData })
+        for (const nvrhi::BufferHandle& b : { d->surfaceDescriptors, d->controlPointIndices, d->patchPoints, d->patchPointsOffsets })
+            bytes += rtxmg::BufferVramBytes(b);
+    for (const nvrhi::BufferHandle& b : { m_positionKeyframes, m_positionsBuffer, m_posePositions, m_posePositionsPrev,
+                                          m_texcoordsBuffer, m_surfaceToMaterialIndexBuffer, m_topologyQualityBuffer })
+        bytes += rtxmg::BufferVramBytes(b);
+    return bytes;
 }
 
 void SubdivisionSurface::InitDeviceData(nvrhi::ICommandList* commandList)
@@ -623,12 +627,12 @@ void SubdivisionSurface::InitDeviceData(nvrhi::ICommandList* commandList)
 
 bool SubdivisionSurface::HasAnimation() const
 {
-    return !m_positionKeyframeBuffers.empty();
+    return m_numKeyframes > 0;
 }
 
 uint32_t SubdivisionSurface::NumKeyframes() const
 {
-    return (uint32_t)m_positionKeyframeBuffers.size();
+    return m_numKeyframes;
 }
 
 static inline box3 lerpAabb(const box3& a, const box3& b, float t)
@@ -639,21 +643,53 @@ static inline box3 lerpAabb(const box3& a, const box3& b, float t)
     return result;
 }
 
-void SubdivisionSurface::Animate(float animTime, float frameRate)
+std::vector<SubdivisionSurface::Pose> SubdivisionSurface::CreatePoses(uint32_t meshID,
+    std::span<const float> frameOffsets, donut::engine::DescriptorTableManager& descriptorTable,
+    nvrhi::ICommandList* commandList)
 {
-    if (!HasAnimation())
+    // Vulkan storage-buffer view offsets need 256-byte alignment: 64 float3s.
+    const size_t numVerts = m_shape->verts.size();
+    m_poseStride = uint32_t(rtxmg::align_up(numVerts, 64));
+    const size_t numPoses = frameOffsets.size();
+
+    std::vector<float3> rest(m_poseStride * numPoses);
+    for (size_t p = 0; p < numPoses; ++p)
+        std::ranges::copy(m_shape->verts, rest.begin() + p * m_poseStride);
+    m_posePositions     = CreateAndUploadBuffer<float3>(rest, "SubdPosedPositions", commandList);
+    m_posePositionsPrev = CreateAndUploadBuffer<float3>(rest, "SubdPosedPositionsPrev", commandList);
+
+    std::vector<Pose> poses(numPoses);
+    for (size_t p = 0; p < numPoses; ++p)
+    {
+        Pose& pose       = poses[p];
+        pose.meshID      = meshID;
+        pose.frameOffset = frameOffsets[p];
+        pose.range       = nvrhi::BufferRange(p * m_poseStride * sizeof(float3), numVerts * sizeof(float3));
+        pose.patchPoints = commandList->getDevice()->createBuffer(m_vertexDeviceData.patchPoints->getDesc());
+        pose.positionsDescriptor = descriptorTable.CreateDescriptorHandle(
+            nvrhi::BindingSetItem::StructuredBuffer_SRV(0, m_posePositions, nvrhi::Format::UNKNOWN, pose.range));
+        pose.positionsPrevDescriptor = descriptorTable.CreateDescriptorHandle(
+            nvrhi::BindingSetItem::StructuredBuffer_SRV(0, m_posePositionsPrev, nvrhi::Format::UNKNOWN, pose.range));
+        pose.aabb = m_aabb;
+    }
+    return poses;
+}
+
+void SubdivisionSurface::Pose::Animate(const SubdivisionSurface& mesh, float animTime, float frameRate)
+{
+    const uint32_t nframes = mesh.NumKeyframes();
+    if (nframes == 0)
         return;
 
-    uint32_t nframes = static_cast<uint32_t>(m_positionKeyframeBuffers.size());
+    float frameTime = std::fmod(frameOffset + animTime * frameRate, float(nframes));
+    if (frameTime < 0.f)
+        frameTime += float(nframes);
+    const float frame = std::truncf(frameTime);
 
-    float frameTime = m_frameOffset + animTime * frameRate;
-    float frame = std::truncf(frameTime);
-
-    // animation implicitly loops if frameTime >= NumKeyframes
-    m_f0 = static_cast<int>(frame) % nframes;
-    m_f1 = (m_f0 + 1) % nframes;
-
-    m_dt = frameTime - frame;
-
-    m_aabb = lerpAabb(m_aabbKeyframes[m_f0], m_aabbKeyframes[m_f1], animTime);
+    // The last keyframe holds until the loop wraps; blending it into keyframe 0
+    // would morph across the discontinuity.
+    f0    = static_cast<uint32_t>(frame) % nframes;
+    f1    = std::min(f0 + 1, nframes - 1);
+    blend = frameTime - frame;
+    aabb  = lerpAabb(mesh.m_aabbKeyframes[f0], mesh.m_aabbKeyframes[f1], blend);
 }

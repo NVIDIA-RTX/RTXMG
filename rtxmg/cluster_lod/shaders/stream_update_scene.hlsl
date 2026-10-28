@@ -66,7 +66,7 @@
     vertex/index byte bases from the header offsets.
 
   * The CLAS-build inner loop writes per-cluster
-    `nvrhi::rt::cluster::IndirectTriangleClasArgs` into a discretely-bound
+    `donut::cluster::IndirectTriangleClasArgs` into a discretely-bound
     UAV `u_NewClasBuilds` (register u11), which the host binds at
     `m_clasIndirectArgsBuffer`.  No CPU-side fill — the GPU is the only
     writer.  The follow-up CLAS Implicit build in ApplyResidencyUpdate reads
@@ -83,6 +83,7 @@
 #include "feature_gates.hlsli"
 #include "rtxmg/cluster_lod/shaders/cluster_lod_material_resolve.hlsli"
 #include <nvrhi/nvrhiHLSL.h>
+#include <donut/shaders/cluster_args.hlsli>
 
 ////////////////////////////////////////////
 
@@ -102,7 +103,7 @@ RWStructuredBuffer<shaderio::SceneStreaming>                   streamingRW      
 RWStructuredBuffer<uint>                                       u_ActiveGroups           : register(u8);
 RWStructuredBuffer<uint>                                       u_GroupIDs               : register(u9);
 RWStructuredBuffer<shaderio::ClusterAddress>                   u_ResidentClusters       : register(u10);
-RWStructuredBuffer<nvrhi::rt::cluster::IndirectTriangleClasArgs> u_NewClasBuilds        : register(u11);
+RWStructuredBuffer<donut::cluster::IndirectTriangleClasArgs> u_NewClasBuilds        : register(u11);
 // Scene-wide mixed-cluster geometry-indices task queue; per-task slot =
 // sceneMaxClusterTriangles entries (one per triangle of the resulting CLAS).
 // The first two entries of a slot temporarily carry the cluster reference for
@@ -242,14 +243,17 @@ void main(uint3 gid : SV_DispatchThreadID)
 
             // Per-cluster IndirectTriangleClasArgs for ApplyResidencyUpdate's
             // Implicit-destinations CLAS build.
-            nvrhi::rt::cluster::IndirectTriangleClasArgs arg;
+            donut::cluster::IndirectTriangleClasArgs arg;
             arg.clusterId                         = clusterResidentID;
             arg.clusterFlags                      = 0;
-            arg.triangleCount                     = uint(cluster.triangleCountMinusOne) + 1u;
-            arg.vertexCount                       = uint(cluster.vertexCountMinusOne)   + 1u;
-            arg.positionTruncateBitCount          = streamingRW[0].clasPositionTruncateBits;
+            arg.triangleCount                     = uint16_t(uint(cluster.triangleCountMinusOne) + 1u);
+            arg.vertexCount                       = uint16_t(uint(cluster.vertexCountMinusOne)   + 1u);
+            arg.positionTruncateBitCount          = uint16_t(streamingRW[0].clasPositionTruncateBits);
+#if !DONUT_CLUSTER_API_DXR
+            // The DXR cluster API takes both index formats per operation instead of per argument.
             arg.indexFormat                       = 1u;  // OperationIndexFormat::IndexFormat8bit
             arg.opacityMicromapIndexFormat        = 0u;
+#endif
             arg.baseGeometryIndexAndFlags         = (nvrhi::rt::cluster::GeometryIndexAndFlags)0;
             arg.indexBufferStride                 = uint16_t(1);
             arg.vertexBufferStride                = uint16_t(4 * 3);
@@ -267,6 +271,11 @@ void main(uint3 gid : SV_DispatchThreadID)
             arg.geometryIndexAndFlagsBuffer       = 0;
             arg.opacityMicromapArray              = 0;
             arg.opacityMicromapIndexBuffer        = 0;
+#if DONUT_CLUSTER_API_DXR
+            arg.opacityMicromapBaseLocation       = 0;
+            arg.geometryIndexAndFlagsIndexBuffer  = 0;
+            arg.reservedPadding                   = uint16_t(0);
+#endif
 
             // Mixed clusters carry per-triangle alpha/two-sided state and
             // need the CLAS build's geometryIndexAndFlagsBuffer filled by

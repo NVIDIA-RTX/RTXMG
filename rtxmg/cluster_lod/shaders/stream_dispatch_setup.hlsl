@@ -40,6 +40,7 @@
 #include "rtxmg/cluster_lod/shaderio.h"
 #include "feature_gates.hlsli"
 #include <donut/shaders/binding_helpers.hlsli>
+#include <donut/shaders/cluster_args.hlsli>
 
 ////////////////////////////////////////////
 
@@ -62,7 +63,7 @@ RWStructuredBuffer<uint64_t>                          u_MoveClasSrcAddresses   :
 RWStructuredBuffer<uint64_t>                          u_MoveClasDstAddresses   : register(u6);
 RWStructuredBuffer<shaderio::SceneStreaming>          streamingRW              : register(u7);
 StructuredBuffer<shaderio::StreamingPatch>            t_Patches                : register(t0);
-StructuredBuffer<uint>                                t_NewClasSizes           : register(t1);
+StructuredBuffer<donut::cluster::OperationSize>    t_NewClasSizes           : register(t1);
 StructuredBuffer<uint64_t>                            t_NewClasAddresses       : register(t2);
 // GPU-persistent allocator scalars (clasCompactionUsedSize /
 // clasAllocatedMaxSizedLeft).  Kept out of the host-uploaded SceneStreaming so

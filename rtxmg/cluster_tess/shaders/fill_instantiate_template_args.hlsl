@@ -12,12 +12,13 @@
 #pragma pack_matrix(row_major)
 
 #include <nvrhi/nvrhiHLSL.h>
+#include <donut/shaders/cluster_args.hlsli>
 #include "rtxmg/cluster_tess/fill_instantiate_template_args_params.h"
 
 ConstantBuffer<FillInstantiateTemplateArgsParams> g_Params : register(b0);
 
 StructuredBuffer<nvrhi::GpuVirtualAddress> t_TemplateAddresses : register(t0);
-RWStructuredBuffer<nvrhi::rt::cluster::IndirectInstantiateTemplateArgs> u_InstantiateTemplateArgs : register(u0);
+RWStructuredBuffer<donut::cluster::IndirectInstantiateTemplateArgs> u_InstantiateTemplateArgs : register(u0);
 
 [numthreads(kFillInstantiateTemplateArgsThreads, 1, 1)]
 void main(uint3 threadIdx : SV_DispatchThreadID)
@@ -26,7 +27,7 @@ void main(uint3 threadIdx : SV_DispatchThreadID)
     if (templateIndex >= g_Params.numTemplates)
         return;
 
-    nvrhi::rt::cluster::IndirectInstantiateTemplateArgs args = (nvrhi::rt::cluster::IndirectInstantiateTemplateArgs)0;
+    donut::cluster::IndirectInstantiateTemplateArgs args = (donut::cluster::IndirectInstantiateTemplateArgs)0;
     args.clusterTemplate = t_TemplateAddresses[templateIndex];
     args.vertexBuffer.startAddress = 0; // not providing vertex positions returns the worst case m_size 
     args.vertexBuffer.strideInBytes = 0;

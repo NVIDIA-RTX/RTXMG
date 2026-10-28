@@ -19,6 +19,7 @@
 #include <chrono>
 #include <filesystem>
 #include <numbers>
+#include <thread>
 
 #include "rtxmg/cluster_lod/cluster_lod_gltf_importer.h"
 #include "rtxmg/cluster_lod/baking/bake_progress.h"
@@ -31,6 +32,8 @@
 #include "rtxmg/subdivision/shape.h"
 #include "rtxmg/subdivision/subdivision_surface.h"
 #include "rtxmg/subdivision/topology_cache.h"
+#include "rtxmg/utils/parallel_for.h"
+#include "rtxmg/utils/vram_bytes.h"
 
 using namespace donut;
 
@@ -49,7 +52,9 @@ RTXMGScene::RTXMGScene(const RTXMGSceneParams& p)
     m_commonPasses(p.commonPasses),
     m_logClusterLod(p.logClusterLod),
     m_clusterBakerConfig(p.clusterBakerConfig),
-    m_clusterCacheDir(p.clusterCacheDir)
+    m_clusterCacheDir(p.clusterCacheDir),
+    m_clusterBakeWorkers(p.clusterBakeWorkers),
+    m_cancelLoad(p.cancelLoad)
 {
     m_attributes.frameRange = p.initialFrameRange;
 }
@@ -121,12 +126,76 @@ uint32_t RTXMGScene::TotalSubdPatchCount() const
     return sum;
 }
 
+uint64_t RTXMGScene::GetSubdVramBytes() const
+{
+    uint64_t bytes = 0;
+    for (const auto& mesh : m_subdMeshes)
+        bytes += mesh->GetVramBytes();
+    for (const SubdivisionSurface::Pose& pose : m_subdPoses)
+        bytes += rtxmg::BufferVramBytes(pose.patchPoints);
+    for (const auto& map : m_topologyMaps)
+        bytes += map->GetVramBytes();
+    return bytes;
+}
+
 void RTXMGScene::Animate(float animTime, float animRate)
 {
-    for (auto& subd : m_subdMeshes)
+    for (auto& pose : m_subdPoses)
+        pose.Animate(*m_subdMeshes[pose.meshID], animTime, animRate);
+}
+
+void RTXMGScene::BuildSubdPoses(nvrhi::ICommandList* commandList)
+{
+    m_subdPoses.clear();
+    for (uint32_t meshID = 0; meshID < m_subdMeshes.size(); ++meshID)
     {
-        subd->Animate(animTime, animRate);
+        SubdivisionSurface& mesh = *m_subdMeshes[meshID];
+        if (!mesh.HasAnimation())
+            continue;
+
+        std::vector<float> offsets;
+        for (const Instance& instance : m_subdInstances)
+            if (instance.meshID == meshID && std::ranges::find(offsets, instance.frameOffset) == offsets.end())
+                offsets.push_back(instance.frameOffset);
+        if (offsets.empty())
+            continue;
+
+        const uint32_t firstPose = uint32_t(m_subdPoses.size());
+        std::ranges::move(mesh.CreatePoses(meshID, offsets, *m_descriptorTable, commandList),
+                          std::back_inserter(m_subdPoses));
+        for (Instance& instance : m_subdInstances)
+            if (instance.meshID == meshID)
+                instance.poseID = firstPose + uint32_t(std::ranges::find(offsets, instance.frameOffset) - offsets.begin());
     }
+    if (!m_subdPoses.empty())
+        log::info("RTXMGScene: %zu animated subd poses for %zu instances", m_subdPoses.size(),
+                  m_subdInstances.size());
+}
+
+const SubdivisionSurface::Pose* RTXMGScene::GetSubdPose(const Instance& instance) const
+{
+    return instance.poseID < m_subdPoses.size() ? &m_subdPoses[instance.poseID] : nullptr;
+}
+
+nvrhi::BindingSetItem RTXMGScene::GetSubdPositions(uint32_t slot, const Instance& instance) const
+{
+    const SubdivisionSurface& mesh = *m_subdMeshes[instance.meshID];
+    if (const SubdivisionSurface::Pose* pose = GetSubdPose(instance))
+        return nvrhi::BindingSetItem::StructuredBuffer_SRV(slot, mesh.m_posePositions, nvrhi::Format::UNKNOWN,
+                                                          pose->range);
+    return nvrhi::BindingSetItem::StructuredBuffer_SRV(slot, mesh.m_positionsBuffer);
+}
+
+nvrhi::IBuffer* RTXMGScene::GetSubdPatchPoints(const Instance& instance) const
+{
+    const SubdivisionSurface::Pose* pose = GetSubdPose(instance);
+    return pose ? pose->patchPoints.Get() : m_subdMeshes[instance.meshID]->m_vertexDeviceData.patchPoints.Get();
+}
+
+box3 RTXMGScene::GetSubdAabb(const Instance& instance) const
+{
+    const SubdivisionSurface::Pose* pose = GetSubdPose(instance);
+    return pose ? pose->aabb : m_subdMeshes[instance.meshID]->m_aabb;
 }
 
 static Instance& operator << (Instance& instance, const Json::Value& node)
@@ -150,6 +219,9 @@ static Instance& operator << (Instance& instance, const Json::Value& node)
 
     if (const auto& value = node["scaling"]; !value.isNull())
         value >> instance.scaling;
+
+    if (const auto& value = node["frame offset"]; value.isNumeric())
+        instance.frameOffset = value.asFloat();
 
     instance.UpdateLocalTransform();
 
@@ -193,89 +265,126 @@ static RTXMGScene::Attributes& operator << (RTXMGScene::Attributes& attrs, const
     return attrs;
 }
 
-std::optional<RTXMGScene::PrebakedClusterModel>
-RTXMGScene::TakePrebakedClusterModel(const std::filesystem::path& gltfPath)
+void RTXMGScene::InsertClusterLodModelWithMetadata(ClusterLodModel&& model, nvrhi::ICommandList* commandList)
+{
+    const size_t numGeom = model.geometries.size();
+    std::vector<ClusterLodPrebuiltGeometryMetadata> metadata(numGeom);
+    if (numGeom > 0)
+    {
+        std::vector<const GeometryView*> geometries(numGeom);
+        for (size_t i = 0; i < numGeom; ++i)
+            geometries[i] = &model.geometries[i];
+        const ClusterLodMetadataArena arena = ClusterLodMetadataArena::Create(geometries, m_device);
+
+        // Leave two cores for the main and present threads.
+        const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
+        const uint32_t workerCount = m_loadThreadPool ? (hw > 4 ? hw - 2 : hw) : 1u;
+
+        rtxmg::GetBakeProgress().Begin(uint32_t(numGeom), 0, workerCount, "Uploading cluster LOD geometry");
+        struct EndGuard { ~EndGuard() { rtxmg::GetBakeProgress().End(); } } endGuard;
+        const auto t0 = std::chrono::steady_clock::now();
+
+        // One deferred list per worker: nvrhi allows a single open immediate list.
+        std::vector<nvrhi::CommandListHandle> workerCLs(workerCount);
+        auto buildOne = [&](size_t i, uint32_t w)
+        {
+            if (IsLoadCancelled())
+                return;
+            nvrhi::ICommandList* cl = commandList;
+            if (m_loadThreadPool)
+            {
+                if (!workerCLs[w])
+                {
+                    workerCLs[w] = m_device->createCommandList(
+                        nvrhi::CommandListParameters().setEnableImmediateExecution(false));
+                    workerCLs[w]->open();
+                }
+                cl = workerCLs[w];
+            }
+            metadata[i] = ClusterLodPrebuiltGeometryMetadata::Build(
+                model.geometries[i], arena, i, m_descriptorTable.get(), cl);
+            rtxmg::GetBakeProgress().CompleteOne(w);
+        };
+        if (m_loadThreadPool)
+            rtxmg::ParallelFor(*m_loadThreadPool, workerCount, numGeom, buildOne);
+        else
+            for (size_t i = 0; i < numGeom; ++i)
+                buildOne(i, 0);
+
+        for (auto& cl : workerCLs)
+        {
+            if (!cl)
+                continue;
+            cl->close();
+            m_metadataCommandLists.push_back(std::move(cl));
+        }
+
+        if (m_logClusterLod)
+            log::info("RTXMGScene: built cluster-LOD geometry metadata for %zu geometries "
+                      "in %.0f ms (%u workers)", numGeom,
+                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                      workerCount);
+    }
+
+    InsertClusterLodModel(std::move(model));
+    std::ranges::move(metadata, std::back_inserter(m_clusterLodPrebuiltMetadata));
+    assert(m_clusterLodPrebuiltMetadata.size() == m_clusterLodGeometries.size());
+}
+
+bool RTXMGScene::InsertClusterLodGltf(const std::filesystem::path& gltfPath, const affine3& nodeTransform,
+                                      nvrhi::ICommandList* commandList)
 {
     const fs::path key = gltfPath.lexically_normal();
-    for (auto it = m_prebakedClusterModels.begin(); it != m_prebakedClusterModels.end(); ++it)
+    auto inserted = std::ranges::find(m_insertedClusterModels, key, &InsertedClusterModel::path);
+    const size_t firstInstance = m_clusterLodInstances.size();
+    if (inserted != m_insertedClusterModels.end())
     {
-        if (it->path == key)
+        m_clusterLodInstances.insert(m_clusterLodInstances.end(),
+                                     inserted->instances.begin(), inserted->instances.end());
+    }
+    else
+    {
+        ClusterLodGltfImporter gltfImporter(m_clusterBakerConfig, m_logClusterLod, m_clusterCacheDir,
+                                            m_clusterBakeWorkers);
+        auto clusterModel = gltfImporter.Load(gltfPath);
+        if (!clusterModel.has_value())
+            return false;
+        InsertClusterLodModelWithMetadata(std::move(*clusterModel), commandList);
+        m_insertedClusterModels.push_back(
+            { key, { m_clusterLodInstances.begin() + firstInstance, m_clusterLodInstances.end() } });
+    }
+
+    if (nodeTransform != affine3::identity())
+    {
+        for (size_t i = firstInstance; i < m_clusterLodInstances.size(); ++i)
         {
-            std::optional<PrebakedClusterModel> entry = std::move(*it);
-            m_prebakedClusterModels.erase(it);
-            return entry;
+            ClusterLodInstance& inst = m_clusterLodInstances[i];
+            inst.transform = affineToHomogeneous(homogeneousToAffine(inst.transform) * nodeTransform);
         }
     }
-    return std::nullopt;
+    return true;
 }
 
-void RTXMGScene::InsertClusterLodModelWithMetadata(
-    ClusterLodModel&&                          model,
-    std::vector<ClusterLodPrebuiltGeometryMetadata>&& metadata)
+void RTXMGScene::InsertSubdObj(const std::filesystem::path& objPath, const std::string& modelName,
+                               const Instance& instance, ObjImporter& objImporter,
+                               nvrhi::ICommandList* commandList)
 {
-    const size_t baseGeoID = m_clusterLodGeometries.size();
-    InsertClusterLodModel(std::move(model));
-
-    // Index-aligned with the geometry array: slots without pre-built metadata stay
-    // invalid, and the splash pump / init fallback builds them.
-    m_clusterLodPrebuiltMetadata.resize(m_clusterLodGeometries.size());
-    for (size_t i = 0; i < metadata.size() && baseGeoID + i < m_clusterLodPrebuiltMetadata.size(); ++i)
-        m_clusterLodPrebuiltMetadata[baseGeoID + i] = std::move(metadata[i]);
-}
-
-bool RTXMGScene::PumpClusterLodPrebuiltMetadataUploads(nvrhi::ICommandList* commandList, double budgetMs)
-{
-    const size_t numGeom = m_clusterLodGeometries.size();
-    if (m_clusterLodPrebuiltCursor >= numGeom)
-        return true;
-
-    if (m_clusterLodPrebuiltMetadata.size() < numGeom)
-        m_clusterLodPrebuiltMetadata.resize(numGeom);
-
-    // Entries pre-built on the scene-load thread are skipped for free; only
-    // publish loading-bar progress when there is real work left.
-    if (m_clusterLodPrebuiltCursor == 0 &&
-        std::any_of(m_clusterLodPrebuiltMetadata.begin(), m_clusterLodPrebuiltMetadata.end(),
-                    [](const ClusterLodPrebuiltGeometryMetadata& m) { return !m.IsValid(); }))
+    const fs::path key = objPath.lexically_normal();
+    auto inserted = std::ranges::find(m_insertedSubdModels, key, &InsertedSubdModel::path);
+    if (inserted != m_insertedSubdModels.end())
     {
-        rtxmg::GetBakeProgress().Begin(uint32_t(numGeom), 0, 0,
-                                    "Uploading cluster LOD geometry");
+        Instance copy = instance;
+        copy.meshID = inserted->meshID;
+        copy.aabb   = m_subdMeshes[copy.meshID]->m_aabb * copy.localToWorld;
+        m_subdInstances.push_back(std::move(copy));
+        return;
     }
 
-    const bool publishProgress = rtxmg::GetBakeProgress().IsActive();
-    size_t     builtThisCall   = 0;
-    const auto t0 = std::chrono::steady_clock::now();
-    while (m_clusterLodPrebuiltCursor < numGeom)
-    {
-        ClusterLodPrebuiltGeometryMetadata& entry = m_clusterLodPrebuiltMetadata[m_clusterLodPrebuiltCursor];
-        if (!entry.IsValid())
-        {
-            entry = ClusterLodPrebuiltGeometryMetadata::Build(
-                m_clusterLodGeometries[m_clusterLodPrebuiltCursor], m_descriptorTable.get(),
-                m_device, commandList);
-            ++builtThisCall;
-        }
-        ++m_clusterLodPrebuiltCursor;
-        if (publishProgress)
-            rtxmg::GetBakeProgress().CompleteOne(0);
-
-        if (budgetMs > 0.0 && builtThisCall > 0 &&
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - t0).count() >= budgetMs)
-            break;
-    }
-
-    if (m_clusterLodPrebuiltCursor >= numGeom)
-    {
-        if (publishProgress)
-        {
-            rtxmg::GetBakeProgress().End();
-            log::info("RTXMGScene: pre-uploaded cluster-LOD geometry metadata for %zu geometries "
-                      "(splash pump)", numGeom);
-        }
-        return true;
-    }
-    return false;
+    auto model = objImporter.Load(modelName, *m_textureCache, { 0, 0 }, instance, commandList);
+    if (!model.has_value() || !model->subd)
+        return;
+    m_insertedSubdModels.push_back({ key, uint32_t(m_subdMeshes.size()) });
+    InsertModel(std::move(*model));
 }
 
 void RTXMGScene::LoadSceneFile(const std::filesystem::path& m_filepath, std::unique_ptr<ObjImporter>& objImporter, nvrhi::ICommandList* commandList)
@@ -340,30 +449,14 @@ void RTXMGScene::LoadSceneFile(const std::filesystem::path& m_filepath, std::uni
                     const fs::path loadPath =
                         resolvedPath.empty() ? fp.parent_path() / modelPath : resolvedPath;
 
-                    // Reuse the model the load thread imported off-thread for this
-                    // gltf, if there is one; otherwise import inline.
-                    std::optional<PrebakedClusterModel> prebaked = TakePrebakedClusterModel(loadPath);
-                    if (!prebaked.has_value())
-                    {
-                        ClusterLodGltfImporter gltfImporter(m_clusterBakerConfig, m_logClusterLod, m_clusterCacheDir);
-                        if (auto clusterModel = gltfImporter.Load(loadPath); clusterModel.has_value())
-                            prebaked = PrebakedClusterModel{ loadPath, std::move(*clusterModel), {} };
-                    }
-
-                    if (prebaked.has_value())
-                        InsertClusterLodModelWithMetadata(std::move(prebaked->model),
-                                                          std::move(prebaked->metadata));
-                    else
+                    if (!InsertClusterLodGltf(loadPath, instance.localToWorld, commandList))
                         log::warning("RTXMGScene::LoadSceneFile: Failed to load GLTF '%s'",
                                      modelPath.string().c_str());
                 }
                 else
                 {
-                    auto model =
-                        objImporter->Load(modelName.asString(), *m_textureCache, { 0, 0 }, instance, commandList);
-
-                    if (model.has_value())
-                        InsertModel(std::move(*model));
+                    InsertSubdObj(fp.parent_path() / modelPath, modelName.asString(), instance,
+                                  *objImporter, commandList);
                 }
             }
 
@@ -416,18 +509,27 @@ bool RTXMGScene::LoadWithThreadPool(const std::filesystem::path& filename,
     {
         // Reset the per-geometry GPU-metadata table before models insert into it.
         m_clusterLodPrebuiltMetadata.clear();
-        m_clusterLodPrebuiltCursor = 0;
+        m_insertedClusterModels.clear();
+        m_insertedSubdModels.clear();
+        m_metadataCommandLists.clear();
+        m_loadThreadPool = threadPool;
 
         std::unique_ptr<ObjImporter> objImporter =
             std::make_unique<ObjImporter>(m_fs, m_mediaPath, m_descriptorTable, topologyCache);
 
-        if (!ImportModels(sanitizedFilePath, objImporter, commandList))
+        const bool imported = ImportModels(sanitizedFilePath, objImporter, commandList);
+        m_loadThreadPool = nullptr;
+        if (!imported || IsLoadCancelled())
         {
             commandList->close();
+            m_metadataCommandLists.clear();
             return false;
         }
 
         ReduceSceneStatistics();
+
+        BuildSubdPoses(commandList);
+        Animate(0.f, m_attributes.frameRate);
 
         m_topologyMaps = topologyCache.InitDeviceData(m_descriptorTable, commandList);
 
@@ -436,10 +538,17 @@ bool RTXMGScene::LoadWithThreadPool(const std::filesystem::path& filename,
     commandList->close();
     // Queue submission is the caller's, on the main thread: it races the
     // Streamline-wrapped present.
-    if (outRecordedCommandLists)
-        outRecordedCommandLists->push_back(commandList);
-    else
-        m_device->executeCommandList(commandList);
+    auto submit = [&](const nvrhi::CommandListHandle& cl)
+    {
+        if (outRecordedCommandLists)
+            outRecordedCommandLists->push_back(cl);
+        else
+            m_device->executeCommandList(cl);
+    };
+    for (const auto& cl : m_metadataCommandLists)
+        submit(cl);
+    m_metadataCommandLists.clear();
+    submit(commandList);
 
     // Build RTXMGSceneGraph
     auto root = std::make_shared<RTXMGSceneNode>();
@@ -487,25 +596,8 @@ bool RTXMGScene::ImportModels(const std::filesystem::path& filepath,
     {
         log::info("RTXMGScene::LoadWithThreadPool: Loading a GLTF file");
 
-        // Reuse the model the load thread imported off-thread, if there is
-        // one; otherwise bake inline here.
-        std::optional<PrebakedClusterModel> prebaked = TakePrebakedClusterModel(filepath);
-        if (!prebaked.has_value())
-        {
-            ClusterLodGltfImporter gltfImporter(m_clusterBakerConfig, m_logClusterLod, m_clusterCacheDir);
-            if (auto clusterModel = gltfImporter.Load(filepath); clusterModel.has_value())
-                prebaked = PrebakedClusterModel{ filepath, std::move(*clusterModel), {} };
-        }
-
-        if (prebaked.has_value())
-        {
-            InsertClusterLodModelWithMetadata(std::move(prebaked->model),
-                                              std::move(prebaked->metadata));
-        }
-        else
-        {
+        if (!InsertClusterLodGltf(filepath, affine3::identity(), commandList))
             log::fatal("RTXMGScene::LoadWithThreadPool: Failed to load the GLTF file");
-        }
     }
     else if (ext == ".json")
     {

@@ -14,6 +14,7 @@
 
 #include <array>
 #include <future>
+#include <optional>
 #include <donut/app/ApplicationBase.h>
 #include <donut/app/Camera.h>
 #include <donut/app/DeviceManager.h>
@@ -75,13 +76,18 @@ private:
     // static: a static survives a scene reload and would suppress the re-apply.
     float m_lastSweptLpe = -1.f;
 
-    // --shot-list walk state.  Each entry cuts the camera, waits for streaming
-    // residency to go flat, then accumulates and captures once per shot.
-    std::vector<ShotEntry> m_shotEntries;
+    // --shot-list walk state: every config walked against every position
+    // (config outer, so resolution/DLSS/LPE -- which reallocate -- change once
+    // per config rather than once per position).  Each position cuts the
+    // camera, waits for streaming residency to go flat, then (if the config has
+    // any) accumulates and captures once per shot.
+    std::vector<ShotPosition> m_shotPositions;
+    std::vector<ShotConfig>   m_shotConfigs;
     enum class ShotPhase { Jump, Settle, Accumulate, Done };
-    ShotPhase m_shotPhase        = ShotPhase::Jump;
-    size_t    m_shotEntryIndex   = 0;
-    size_t    m_shotIndex        = 0;
+    ShotPhase m_shotPhase         = ShotPhase::Jump;
+    size_t    m_shotConfigIndex   = 0;
+    size_t    m_shotPositionIndex = 0;
+    size_t    m_shotIndex         = 0;  // index into m_shotConfigs[m_shotConfigIndex].shots
     uint32_t  m_shotPhaseFrames  = 0;  // frames spent in the current phase
     uint32_t  m_shotSettleFrames = 0;  // what Settle actually cost, for the record
     // Residency-flatness tracking for `settle: "auto"`.
@@ -92,12 +98,39 @@ private:
     // Set at the top of the frame whose framebuffer is the one to save; the
     // capture itself has to wait until that framebuffer exists.
     bool      m_shotPendingCapture       = false;
-    // Where this entry's records start, so its own dump carries only them.
+    // Where this position's records start, so its own dump carries only them.
     size_t    m_shotRecordsAtEntryStart  = 0;
-    // Writes <shot-out>/stats/<label>.stats.json as the entry finishes.
-    void DumpShotEntryStats(const ShotEntry& entry);
-    // Applies an entry's "resolution"; a no-op in fullscreen.
-    void SetShotOutputResolution(const ShotEntry& entry);
+    // True once RunShotList() (UI-triggered) is driving the walk, rather than a
+    // --shot-list CLI arg -- gates whether completion closes the window or
+    // hands control back to the interactive session.
+    bool      m_shotInteractiveRun       = false;
+    // What a UI-triggered walk changes, put back when it finishes or is aborted.
+    struct ShotRestoreState
+    {
+        std::string                               camera;
+        ShadingMode                               shadingMode;
+        ColorMode                                 colorMode;
+        bool                                      wireframe;
+        float                                     exposure;
+        bool                                      autoExposure;
+        donut::app::StreamlineInterface::DLSSMode dlssMode;
+        float                                     lodPixelError;
+        bool                                      adaptiveLodError;
+        bool                                      normalMapShading;
+        GLFWmonitor*                              monitor;  // non-null when fullscreen
+        int                                       windowX, windowY, windowW, windowH;
+        bool                                      decorated;
+    };
+    std::optional<ShotRestoreState> m_shotRestore;
+    void RestoreAfterShotList();
+    // The trackball caches orientation and distance; re-derive them after any
+    // direct m_camera change, or the next mouse/key move snaps back.
+    void SyncTrackballToCamera();
+    // Writes <shot-out>/stats/<config>/<label>.stats.json as the position finishes.
+    void DumpPositionStats(const ShotPosition& pos, const ShotConfig& config);
+    // Applies a config's "resolution"; a no-op in fullscreen.
+    void SetShotOutputResolution(const ShotConfig& config);
+    void AdvancePosition();
 
     // BeginShot force-resets the subframe index, which restarts DLSS-RR's
     // temporal history with it.  Capturing before that has re-accumulated
@@ -110,12 +143,40 @@ private:
     }
 
 public:
+    bool ShotListActive() const { return !m_shotPositions.empty() && !m_shotConfigs.empty(); }
+
     // A --shot-list walk or a -nf run: nothing interactive, and the window must
     // do what the command line says rather than what the last session left.
     bool IsAutomatedRun() const
     {
-        return !m_shotEntries.empty() || m_args.exitAfterFrame >= 0;
+        return ShotListActive() || m_args.exitAfterFrame >= 0;
     }
+
+    // Camera-only cut to a position's recorded pose; does not touch any
+    // config setting (resolution/DLSS/LPE/exposure).
+    void JumpCameraToShot(const ShotPosition& pos) { SetCameraString(pos.camera); }
+    std::string GetCameraString() const { return m_camera.ToString(); }
+    // A camera cut to `camera`; false (camera untouched) if it doesn't parse.
+    bool SetCameraString(const std::string& camera)
+    {
+        if (!m_camera.Set(camera))
+            return false;
+        m_cameraReset = true;
+        SyncTrackballToCamera();
+        return true;
+    }
+    float GetCameraFovY() const { return m_camera.GetFovY(); }
+    void  SetCameraFovY(float fovY) { m_camera.SetFovY(fovY); }
+
+    // Starts a walk over `positions` x `configs` exactly like --shot-list, but
+    // leaves the window open on completion and restores the camera and view
+    // settings it started from -- this run started from the UI.
+    void RunShotList(std::vector<ShotPosition> positions, std::vector<ShotConfig> configs);
+    // Cancels an interactive run in progress; a no-op otherwise.
+    void AbortShotList();
+    bool IsShotListRunning() const { return ShotListActive() && m_shotPhase != ShotPhase::Done; }
+    size_t GetShotConfigIndex() const { return m_shotConfigIndex; }
+    size_t GetShotPositionIndex() const { return m_shotPositionIndex; }
 
 private:
     std::filesystem::path ShotImageDir() const
@@ -157,6 +218,8 @@ private:
 #endif
     // VK_EXT_memory_budget, requested optional at device creation.
     bool m_vkMemoryBudgetAvailable = false;
+    // NVAPI under -gd with the DXR cluster intrinsics; see the device creation.
+    bool m_forceDxrClusterIntrinsics = false;
 
     // --tess-budget-sweep ladder base, 0 until latched.  Cleared on scene load.
     uint32_t m_tessSweepBaseMaxClusters = 0;
@@ -190,20 +253,13 @@ private:
     int2 m_loadFrameRange = { std::numeric_limits<int>::max(), std::numeric_limits<int>::min() };
 
     // Scene loading is a multi-phase pipeline driven by AdvanceLoad (see Render).
-    // LoadScene() runs the whole CPU half on the load thread: cluster-LOD import
-    // (shard mmap / bake), per-geometry GPU metadata pre-build, scene
-    // construction, the KTX2 texture-mip budget, the texture requests and the
-    // instance grid.  Every phase after it is main-thread, because queue
-    // submission races the Streamline-wrapped present.
-    struct PendingClusterModel
-    {
-        std::filesystem::path                            path;
-        ClusterLodModel                                  model;
-        std::vector<ClusterLodPrebuiltGeometryMetadata>        metadata;
-    };
+    // LoadScene() runs the whole CPU half on the load thread: scene construction,
+    // the KTX2 texture-mip budget, RTXMGScene's load (cluster-LOD shard mmap /
+    // bake, per-geometry GPU metadata, texture requests) and the instance grid.
+    // Every phase after it is main-thread, because queue submission races the
+    // Streamline-wrapped present.
     std::shared_ptr<donut::vfs::IFileSystem> m_pendingSceneFs;
     std::filesystem::path                    m_pendingSceneFile;
-    std::vector<PendingClusterModel>         m_pendingClusterModels;
     // Closed upload command lists recorded by the load thread — one per load-pool
     // worker, plus RTXMGScene's own — submitted by the LoadPhase::Submit step.
     std::vector<nvrhi::CommandListHandle>    m_pendingUploadCLs;
@@ -227,7 +283,6 @@ private:
         None,       // no load in flight
         Import,     // load thread: bake, scene build, texture budget + requests, grid
         Submit,     // execute the command lists the load thread recorded
-        Metadata,   // budgeted cluster-LOD metadata upload pump
         Textures,   // budgeted texture finalize pump
         Reconcile,  // scene settings, CLI precedence, saved UI state, UpdateParams
         Build,      // FinishedLoading + accel structs + camera framing
@@ -251,7 +306,7 @@ private:
 
     std::unique_ptr<RTXMGRenderer> m_renderer;
 
-    nvrhi::BufferHandle m_lerpKeyFramesParamsBuffer;
+    nvrhi::BufferHandle m_lerpPosesBuffer;  // LerpKeyFramesPose per scene pose
     nvrhi::BindingLayoutHandle m_lerpVerticesBL;
     nvrhi::ComputePipelineHandle m_lerpVerticesPSO;
 
@@ -305,10 +360,8 @@ private:
     void DoDumpFineTess(std::string const& filename = "");
     void DoDumpDebugBuffer(std::string const& filename = "");
         
-    void LerpVertices(nvrhi::IBuffer* outBuffer,
-        nvrhi::IBuffer* keyFrame0Buffer,
-        nvrhi::IBuffer* keyFrame1Buffer,
-        unsigned int numVertices, float animTime);
+    // Blends scene poses [firstPose, firstPose + numPoses), all of `mesh`, in one dispatch.
+    void LerpPoses(const SubdivisionSurface& mesh, uint32_t firstPose, uint32_t numPoses);
     void DispatchGPUAnimation();
 
 public:
@@ -349,7 +402,7 @@ public:
     // its own clause or the walk stalls the moment the window loses focus.
     bool ShouldRenderUnfocused() override
     {
-        return m_args.exitAfterFrame >= 0 || !m_shotEntries.empty() || IsSceneLoading();
+        return m_args.exitAfterFrame >= 0 || ShotListActive() || IsSceneLoading();
     }
 
 public:
@@ -359,6 +412,9 @@ public:
 
     bool Init();
     void ResetCamera();
+    // ResetCamera plus the startup exposure / auto-exposure, which a shot-list
+    // jump pins: the user-facing reset (F, the Reset Camera button).
+    void ResetView();
     bool SetEnvmapTex(const std::string& filePath);
 
     // GPU scene build (instance buffers + cluster-LOD accel structs + camera
@@ -386,6 +442,22 @@ public:
     // Re-bucket stats::vramBreakdown from the samplers + a driver query, once a
     // frame.  A view of state that already exists, not a second source of truth.
     void UpdateVramBreakdown();
+
+    // Logs when cluster tessellation demand exceeds its allocation (the UI's
+    // "Tessellation memory budget exceeded"), at most once per 10 s, and once
+    // when it drops back under.
+    void LogTessellationLimit();
+
+    // Logs each 10% move of the GPU's adaptive tessellation rate scale.
+    void LogAdaptiveTessRate();
+    float m_adaptiveTessLoggedScale = 1.f;
+
+#if RTXMG_DEV_FEATURES
+    // --anim-dump: write this frame's albedo and motion vectors (stalls the GPU).
+    void DumpAnimFrame(uint32_t frame);
+#endif
+    std::chrono::steady_clock::time_point m_tessLimitLogTime{};
+    bool m_tessLimitLogged = false;
 
     // Reduce GeometryView::lodStats into stats::bakeStats, once per scene load.
     void RecordBakeStats();
@@ -433,6 +505,11 @@ public:
     // acceleration-structure resources for the loaded scene (re-streams from
     // scratch into the resized pools).
     void ApplyStreamingBudgets();
+
+    // Requested cluster-LoD budgets; they reach the renderer on ApplyStreamingBudgets
+    // or the next scene load.
+    const ClusterLodBudgets& GetClusterLodBudgets() const   { return m_args.clodBudgets; }
+    void SetClusterLodBudgets(const ClusterLodBudgets& b)   { m_args.clodBudgets = b; }
 
     // Texture budget and normal-map LOADING decide what gets read off disk, so
     // unlike the pool budgets above they only take effect on a scene reload.
@@ -541,6 +618,14 @@ public:
 
     float GetCoarseTessellationRate() const { return m_args.coarseTessellationRate; }
     void  SetCoarseTessellationRate(float rate);
+
+    // Under cluster_tess budget pressure the GPU scales the tessellation rates by
+    // GetBuildStats().tessRateScale (<= 1), recovering slowly once pressure drops.
+    bool  GetAdaptiveTessRate() const { return m_args.adaptiveTessRate; }
+    void  SetAdaptiveTessRate(bool b) { m_args.adaptiveTessRate = b; m_accelBuilderNeedsUpdate = true; }
+    const ClusterTessStatistics& GetBuildStats() const { return m_BuildStats; }
+    // Max over the cluster_tess budgets of desired / allocated, from m_BuildStats.
+    float GetTessBudgetLoad() const;
 
     int GetIsolationLevelSharp() const { return m_args.isoLevelSharp; }
     int GetIsolationLevelSmooth() const { return m_args.isoLevelSmooth; }

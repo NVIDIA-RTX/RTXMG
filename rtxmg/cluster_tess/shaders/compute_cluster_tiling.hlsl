@@ -35,6 +35,7 @@
 #include "rtxmg/utils/shader_debug.h"
 
 #include <donut/shaders/binding_helpers.hlsli>
+#include <donut/shaders/cluster_args.hlsli>
 
 #include "rtxmg/cluster_tess/cluster_tess.h"
 #include "rtxmg/subdivision/subdivision_eval.hlsli"
@@ -48,6 +49,7 @@
 #include "rtxmg/hiz/hiz_buffer_constants.h"
 
 #include "rtxmg/cluster_tess/displacement.hlsli"
+#include "rtxmg/utils/wave_size.hlsli"
 
 static const uint32_t kComputeClusterTilingLanes = 32;
 
@@ -65,7 +67,7 @@ StructuredBuffer<SubdivisionPlanHLSL> t_Plans : register(t6);
 StructuredBuffer<uint32_t> t_SubpatchTrees : register(t7);
 StructuredBuffer<Index> t_PatchPointIndices : register(t8);
 StructuredBuffer<float> t_StencilMatrix : register(t9);
-StructuredBuffer<uint32_t> t_ClasInstantiationBytes : register(t10);
+StructuredBuffer<donut::cluster::OperationSize> t_ClasInstantiationBytes : register(t10);
 StructuredBuffer<nvrhi::GpuVirtualAddress> t_TemplateAddresses : register(t11);
 StructuredBuffer<LinearSurfaceDescriptor> t_TexCoordSurfaceDescriptors : register(t12);
 StructuredBuffer<Index> t_TexCoordControlPointIndices : register(t13);
@@ -76,7 +78,7 @@ RWStructuredBuffer<GridSampler> u_GridSamplers : register(u0);
 RWStructuredBuffer<TessellationCounters> u_TessellationCounters : register(u1);
 RWStructuredBuffer<Cluster> u_Clusters : register(u2);
 RWStructuredBuffer<ClusterTessShadingData> u_ClusterTessShadingData : register(u3);
-RWStructuredBuffer<nvrhi::rt::cluster::IndirectInstantiateTemplateArgs> u_IndirectArgData : register(u4);
+RWStructuredBuffer<donut::cluster::IndirectInstantiateTemplateArgs> u_IndirectArgData : register(u4);
 RWStructuredBuffer<nvrhi::GpuVirtualAddress> u_ClasAddresses : register(u5);
 RWStructuredBuffer<float3> u_VertexPatchPoints : register(u6);
 RWStructuredBuffer<float2> u_TexCoordPatchPoints : register(u7);
@@ -134,10 +136,10 @@ bool HiZIsVisible(Box3 aabb)
             uv *= invTileSize * g_Params.invHiZSize;
 
             int lw, lh;
-            t_HiZBuffer[level].GetDimensions(lw, lh);
+            t_HiZBuffer[NonUniformResourceIndex(level)].GetDimensions(lw, lh);
 
             // gather & reduce 4 texels in case the aabb straddles pixel boundaries
-            float4 z4 = t_HiZBuffer[level].Gather(s_HizSampler, uv, 0);
+            float4 z4 = t_HiZBuffer[NonUniformResourceIndex(level)].Gather(s_HizSampler, uv, 0);
             float zfar = max(max(z4.x, z4.y), max(z4.z, z4.w));
 
             if (aabb.m_min.z > zfar)
@@ -420,11 +422,11 @@ float CalculateEdgeRates(LimitFrame limitFrame)
 #if TESS_MODE == TESS_MODE_SPHERICAL_PROJECTION
     const float3 poi = mul(g_Params.localToWorld, float4(limitFrame.p, 1.0f)).xyz;
     const float distance = max(length(poi - g_Params.cameraPos), 0.01f);
-    float edgeRate = float(g_Params.viewportSize.y) * g_Params.fineTessellationRate / distance;
+    float edgeRate = float(g_Params.viewportSize.y) * g_Params.fineTessellationRate * u_TessellationCounters[0].rateScale / distance;
     return edgeRate;
 #elif TESS_MODE == TESS_MODE_WORLD_SPACE_EDGE_LENGTH
     float diagonalLength = length(g_Params.aabb.Extent());
-    return g_Params.fineTessellationRate * 1000.f / diagonalLength;
+    return g_Params.fineTessellationRate * u_TessellationCounters[0].rateScale * 1000.f / diagonalLength;
 #endif
     return -1; // should not Get here; uniform tess mode doesn't call this function
 }
@@ -481,7 +483,7 @@ void GathererWriteCluster(Cluster cluster, uint32_t clusterIndex, GridSampler gr
 {
     const nvrhi::GpuVirtualAddress vertexBufferAddress = g_Params.clusterVertexPositionsBaseAddress + nvrhi::GpuVirtualAddress(cluster.nVertexOffset * sizeof(float3));
 
-    nvrhi::rt::cluster::IndirectInstantiateTemplateArgs indirectArgs = (nvrhi::rt::cluster::IndirectInstantiateTemplateArgs)0;
+    donut::cluster::IndirectInstantiateTemplateArgs indirectArgs = (donut::cluster::IndirectInstantiateTemplateArgs)0;
     indirectArgs.clusterIdOffset = clusterIndex;
     indirectArgs.geometryIndexOffset = 0;
     indirectArgs.clusterTemplate = templateAddress;
@@ -525,7 +527,7 @@ void WriteSurfaceWave(uint32_t iWave, uint32_t iLane, uint32_t iSurface, GridSam
         uint32_t tilingClusterCount = clusterTiling.ClusterCount();
         uint32_t tilingVertexCount = clusterTiling.VertexCount();
 
-        clasBlocks = (t_ClasInstantiationBytes[templateIndex] / nvrhi::rt::cluster::kClasByteAlignment) * tilingClusterCount;
+        clasBlocks = (uint(t_ClasInstantiationBytes[templateIndex]) / nvrhi::rt::cluster::kClasByteAlignment) * tilingClusterCount;
 
         clasBlocks += WaveReadLaneAt(clasBlocks, WaveGetLaneIndex() + 2); // Lanes: [0+2], [1+3]
         clasBlocks += WaveReadLaneAt(clasBlocks, WaveGetLaneIndex() + 1); // Lanes: [0+1]
@@ -556,7 +558,7 @@ void WriteSurfaceWave(uint32_t iWave, uint32_t iLane, uint32_t iSurface, GridSam
 
             clusterCount += tilingClusterCount;
             vertexCount += tilingVertexCount;
-            clasBlocks += (t_ClasInstantiationBytes[templateIndex] / nvrhi::rt::cluster::kClasByteAlignment) * tilingClusterCount;
+            clasBlocks += (uint(t_ClasInstantiationBytes[templateIndex]) / nvrhi::rt::cluster::kClasByteAlignment) * tilingClusterCount;
         }
 #endif
         clusterTris = 2 * (uint32_t)surfaceSize.x * (uint32_t)surfaceSize.y;
@@ -658,7 +660,7 @@ void WriteSurfaceWave(uint32_t iWave, uint32_t iLane, uint32_t iSurface, GridSam
 
         const uint32_t templateIndex = GetTemplateIndex(tilingClusterSize);
         nvrhi::GpuVirtualAddress templateAddress = t_TemplateAddresses[templateIndex];
-        uint32_t clasBytes = t_ClasInstantiationBytes[templateIndex];
+        uint32_t clasBytes = uint(t_ClasInstantiationBytes[templateIndex]);
 
         // make clusters with tilingSize
         for (uint32_t iCluster = iLane;
@@ -680,6 +682,7 @@ void WriteSurfaceWave(uint32_t iWave, uint32_t iLane, uint32_t iSurface, GridSam
     }
 }
 
+RTXMG_WAVE_SIZE_32
 [numthreads(kComputeClusterTilingLanes * kComputeClusterTilingWaves, 1, 1)]
 void main(uint3 threadIdx : SV_GroupThreadID, uint3 groupIdx : SV_GroupID)
 {  

@@ -46,6 +46,7 @@
 
 #include "rtxmg/cluster_lod/shaderio.h"
 #include "feature_gates.hlsli"
+#include <donut/shaders/cluster_args.hlsli>
 
 ////////////////////////////////////////////
 
@@ -57,7 +58,7 @@ RWStructuredBuffer<uint64_t>                  u_MoveClasSrcAddresses  : register
 RWStructuredBuffer<uint64_t>                  u_MoveClasDstAddresses  : register(u6);
 RWStructuredBuffer<shaderio::SceneStreaming>  streamingRW             : register(u7);
 RWStructuredBuffer<uint>                      u_NewClasResidentIDs    : register(u14);
-StructuredBuffer<uint>                        t_NewClasSizes          : register(t1);
+StructuredBuffer<donut::cluster::OperationSize> t_NewClasSizes          : register(t1);
 StructuredBuffer<uint64_t>                    t_NewClasAddresses      : register(t2);
 // Raw view of the same SceneStreaming buffer for the 64-bit moveClasSize cursor
 // atomic (see shaderio::kStreamingMoveClasSizeByteOffset in shaderio.h and
@@ -80,7 +81,7 @@ void main(uint3 dtid : SV_DispatchThreadID)
 
     if (valid)
     {
-        clasSize    = t_NewClasSizes[newID];
+        clasSize    = uint(t_NewClasSizes[newID]);
         clasAddress = t_NewClasAddresses[newID];
     }
 

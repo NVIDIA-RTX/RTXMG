@@ -61,6 +61,8 @@
 
 #include "rtxmg/cluster_lod/shaderio.h"
 #include "feature_gates.hlsli"
+#include <donut/shaders/cluster_args.hlsli>
+#include "rtxmg/utils/wave_size.hlsli"
 
 ////////////////////////////////////////////
 
@@ -72,7 +74,7 @@ RWStructuredBuffer<uint64_t>                  u_MoveClasSrcAddresses    : regist
 RWStructuredBuffer<uint64_t>                  u_MoveClasDstAddresses    : register(u6);
 RWStructuredBuffer<shaderio::SceneStreaming>  streamingRW               : register(u7);
 StructuredBuffer<shaderio::StreamingPatch>    t_Patches                 : register(t0);
-StructuredBuffer<uint>                        t_NewClasSizes            : register(t1);
+StructuredBuffer<donut::cluster::OperationSize> t_NewClasSizes            : register(t1);
 StructuredBuffer<uint64_t>                    t_NewClasAddresses        : register(t2);
 
 ////////////////////////////////////////////
@@ -126,6 +128,7 @@ bool FindAllocation(inout uint allocSize, inout uint allocPos, uint attempts, ui
     return found;
 }
 
+RTXMG_WAVE_SIZE_32
 [numthreads(shaderio::kStreamAllocatorLoadGroupsThreads, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID)
 {
@@ -173,7 +176,7 @@ void main(uint3 gid : SV_DispatchThreadID)
 
         for (uint c = 0; c < clusterCount; c++)
         {
-            uint clasSize = t_NewClasSizes[newBuildOffset + c];
+            uint clasSize = uint(t_NewClasSizes[newBuildOffset + c]);
             newGroupByteSize += clasSize;
         }
 
@@ -374,7 +377,7 @@ void main(uint3 gid : SV_DispatchThreadID)
         {
             uint clusterResidentID = groupClusterResidentID + c;
 
-            uint     clasSize    = t_NewClasSizes[newBuildOffset + c];
+            uint     clasSize    = uint(t_NewClasSizes[newBuildOffset + c]);
             uint64_t clasAddress = t_NewClasAddresses[newBuildOffset + c];
 
             uint64_t clasNewAddress = groupBaseAddress;

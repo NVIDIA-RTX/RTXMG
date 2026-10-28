@@ -26,6 +26,7 @@
 #include "rtxmg/cluster_tess/cluster_tessellator.h"
 #include "rtxmg/cluster_tess/fill_clusters_params.h"
 #include "rtxmg/cluster_tess/copy_cluster_offset_params.h"
+#include "rtxmg/cluster_tess/update_tess_rate_params.h"
 #include "rtxmg/cluster_tess/fill_blas_from_clas_args_params.h"
 #include "rtxmg/cluster_tess/fill_instantiate_template_args_params.h"
 #include "rtxmg/cluster_tess/compute_cluster_tiling_params.h"
@@ -77,12 +78,6 @@ ClusterTessellator::ClusterTessellator(donut::engine::ShaderFactory& shaderFacto
     //////////////////////////////////////////////////
     m_fillInstantiateTemplateArgsParamsBuffer = m_device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(
         sizeof(FillInstantiateTemplateArgsParams), "FillInstantiateTemplateArgsParams", engine::c_MaxRenderPassConstantBufferVersions));
-
-    m_computeClusterTilingParamsBuffer = m_device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(
-        sizeof(ComputeClusterTilingParams), "ComputeClusterTilingParams", engine::c_MaxRenderPassConstantBufferVersions));
-
-    m_fillClustersParamsBuffer = m_device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(
-        sizeof(FillClustersParams), "FillClustersParams", engine::c_MaxRenderPassConstantBufferVersions));
 
     m_fillBlasFromClasArgsParamsBuffer = m_device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(
         sizeof(FillBlasFromClasArgsParams), "FillBlasFromClasArgsParams", engine::c_MaxRenderPassConstantBufferVersions));
@@ -155,7 +150,8 @@ void ClusterTessellator::FillInstantiateTemplateArgs(nvrhi::IBuffer* outArgs, nv
 
     if (!m_fillInstantiateTemplatePSO)
     {
-        nvrhi::ShaderHandle shader = m_shaderFactory.CreateShader("cluster_tess/fill_instantiate_template_args.hlsl", "main", nullptr, nvrhi::ShaderType::Compute);
+        nvrhi::ShaderHandle shader = m_shaderFactory.CreateShader(
+            GetClusterApiShaderPath(m_device, "cluster_tess/fill_instantiate_template_args.hlsl").c_str(), "main", nullptr, nvrhi::ShaderType::Compute);
 
         auto computePipelineDesc = nvrhi::ComputePipelineDesc()
             .setComputeShader(shader)
@@ -354,45 +350,32 @@ nvrhi::BufferHandle ClusterTessellator::GenerateStructuredClusterTemplateArgs(co
     nvrhi::GpuVirtualAddress indexBufferAddress = indexBuffer->getGpuVirtualAddress();
     nvrhi::GpuVirtualAddress vertexBufferAddress = vertexBuffer->getGpuVirtualAddress();
 
-    uint32_t indexFormat = 0;
-    switch (sizeof(TemplateGrids::IndexType))
-    {
-    case 1: indexFormat = (uint32_t)cluster::OperationIndexFormat::IndexFormat8bit; break;
-    case 2: indexFormat = (uint32_t)cluster::OperationIndexFormat::IndexFormat16bit; break;
-    case 4: indexFormat = (uint32_t)cluster::OperationIndexFormat::IndexFormat32bit; break;
-    default: assert(false);
-    }
-
-    std::vector<cluster::IndirectTriangleTemplateArgs> createTemplateArgData(grids.descs.size());
+    std::vector<cluster::nv::IndirectTriangleTemplateArgs> createTemplateArgData(grids.descs.size());
     for (uint32_t i = 0; i < createTemplateArgData.size(); i++)
     {
         const TemplateGridDesc& grid = grids.descs[i];
 
-        // Zero-initialize unused bit fields 
+        // Zero-initialize unused bit fields
         createTemplateArgData[i] = { };
-        createTemplateArgData[i] = cluster::IndirectTriangleTemplateArgs
-        {
-            .clusterId = 0,
-            .clusterFlags = 0,
-            .triangleCount = grid.getNumTriangles(),
-            .vertexCount = grid.getNumVerts(),
-            .positionTruncateBitCount = 0,
-            .indexFormat = indexFormat,
-            .baseGeometryIndexAndFlags = {},
-            .indexBufferStride = sizeof(grids.indices[0]),
-            .vertexBufferStride = sizeof(grids.vertices[0]) * 3,
-            .geometryIndexAndFlagsBufferStride = 0,
-            .indexBuffer = indexBufferAddress + grid.indexOffset,
-            .vertexBuffer = vertexBufferAddress + grid.vertexOffset,
-            .geometryIndexAndFlagsBuffer = 0,
-            .instantiationBoundingBoxLimit = 0
-        };
+        cluster::nv::IndirectTriangleTemplateArgs& arg = createTemplateArgData[i];
+        arg.clusterId                         = 0;
+        arg.clusterFlags                      = 0;
+        arg.triangleCount                     = grid.getNumTriangles();
+        arg.vertexCount                       = grid.getNumVerts();
+        arg.positionTruncateBitCount          = 0;
+        arg.indexFormat                       = uint32_t(TemplateGrids::kIndexFormat);
+        arg.baseGeometryIndexAndFlags         = {};
+        arg.indexBufferStride                 = sizeof(grids.indices[0]);
+        arg.vertexBufferStride                = sizeof(grids.vertices[0]) * 3;
+        arg.geometryIndexAndFlagsBufferStride = 0;
+        arg.indexBuffer                       = indexBufferAddress + grid.indexOffset;
+        arg.vertexBuffer                      = vertexBufferAddress + grid.vertexOffset;
+        arg.geometryIndexAndFlagsBuffer       = 0;
+        arg.instantiationBoundingBoxLimit     = 0;
     }
 
     nvrhi::BufferDesc clusterTemplateArgsDesc =
     {
-        .byteSize = createTemplateArgData.size() * sizeof(createTemplateArgData[0]),
-        .structStride = sizeof(createTemplateArgData[0]),
         .debugName = "ClusterTemplateArgs",
         .isDrawIndirectArgs = true,
         .isAccelStructBuildInput = true,
@@ -400,7 +383,7 @@ nvrhi::BufferHandle ClusterTessellator::GenerateStructuredClusterTemplateArgs(co
         .keepInitialState = true,
     };
 
-    return CreateAndUploadBuffer(createTemplateArgData, clusterTemplateArgsDesc, commandList);
+    return CreateAndUploadClusterArgs(createTemplateArgData, clusterTemplateArgsDesc, commandList);
 }
 
 void ClusterTessellator::InitStructuredClusterTemplates(nvrhi::ICommandList* commandList)
@@ -433,13 +416,14 @@ void ClusterTessellator::InitStructuredClusterTemplates(nvrhi::ICommandList* com
             .maxTotalTriangleCount = grids.totalTriangles,
             .maxTotalVertexCount = grids.totalVertices,
             .minPositionTruncateBitCount = m_tessellatorConfig.quantNBits,
+            .indexFormat = TemplateGrids::kIndexFormat,
         }
     };
     cluster::OperationSizeInfo sizeInfo = m_device->getClusterOperationSizeInfo(operationParams);
         
     nvrhi::BufferHandle clusterTemplateArgsBuffer = GenerateStructuredClusterTemplateArgs(grids, commandList);
     
-    RTXMGBuffer<uint32_t> templateSizesBuffer;
+    ClusterOperationSizesBuffer templateSizesBuffer;
     templateSizesBuffer.Create(kNumTemplates, "ClusterTemplateSizes", m_device);
 
     cluster::OperationDesc templateGetSizesDesc =
@@ -454,7 +438,7 @@ void ClusterTessellator::InitStructuredClusterTemplates(nvrhi::ICommandList* com
     commandList->executeMultiIndirectClusterOperation(templateGetSizesDesc);
 
     // readback templateSizes
-    std::vector<uint32_t> templateSizes = templateSizesBuffer.Download(commandList);
+    std::vector<uint64_t> templateSizes = templateSizesBuffer.Download(commandList);
     
     if (m_tessellatorConfig.enableLogging)
     {
@@ -518,8 +502,8 @@ void ClusterTessellator::InitStructuredClusterTemplates(nvrhi::ICommandList* com
     // Create and fill out the instantiate args buffer from addressesBuffer
     nvrhi::BufferDesc instantiateTemplateArgsDesc = 
     {
-        .byteSize = sizeof(cluster::IndirectInstantiateTemplateArgs) * kNumTemplates,
-        .structStride = sizeof(cluster::IndirectInstantiateTemplateArgs),
+        .byteSize = sizeof(cluster::nv::IndirectInstantiateTemplateArgs) * kNumTemplates,
+        .structStride = sizeof(cluster::nv::IndirectInstantiateTemplateArgs),
         .debugName = "InstantiateTemplateArgs",
         .canHaveUAVs = true,
         .isDrawIndirectArgs = true,
@@ -528,7 +512,7 @@ void ClusterTessellator::InitStructuredClusterTemplates(nvrhi::ICommandList* com
         .keepInitialState = true,
     };
 
-    RTXMGBuffer<cluster::IndirectInstantiateTemplateArgs> instantiateTemplateArgsBuffer(instantiateTemplateArgsDesc, m_device);
+    RTXMGBuffer<cluster::nv::IndirectInstantiateTemplateArgs> instantiateTemplateArgsBuffer(instantiateTemplateArgsDesc, m_device);
     FillInstantiateTemplateArgs(instantiateTemplateArgsBuffer, m_templateBuffers.addressesBuffer, kNumTemplates, commandList);
 
     if (m_tessellatorConfig.enableLogging)
@@ -650,7 +634,7 @@ void ClusterTessellator::FillInstanceClusters(const RTXMGScene& scene, ClusterTe
                 nvrhi::BufferRange(surfaceOffset * sizeof(GridSampler), surfaceCount * sizeof(GridSampler))))
             .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(1, m_clusterOffsetCountsBuffer))
             .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(2, m_clustersBuffer))
-            .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(3, subd.m_positionsBuffer))
+            .addItem(scene.GetSubdPositions(3, instance))
             // Subd
             .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(4, subd.m_vertexDeviceData.surfaceDescriptors))
             .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(5, subd.m_vertexDeviceData.controlPointIndices))
@@ -659,7 +643,7 @@ void ClusterTessellator::FillInstanceClusters(const RTXMGScene& scene, ClusterTe
             .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(8, subd.GetTopologyMap()->subpatchTreesArraysBuffer))
             .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(9, subd.GetTopologyMap()->patchPointIndicesArraysBuffer))
             .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(10, subd.GetTopologyMap()->stencilMatrixArraysBuffer))
-            .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(11, subd.m_vertexDeviceData.patchPoints))
+            .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(11, scene.GetSubdPatchPoints(instance)))
             .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(12, subd.m_surfaceToMaterialIndexBuffer))
             .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(13, scene.GetMaterialBuffer()))
             .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(14, subd.m_texcoordDeviceData.surfaceDescriptors))
@@ -801,7 +785,7 @@ void ClusterTessellator::ComputeInstanceClusterTiling(ClusterTessAccels& accels,
     params.coarseTessellationRate = m_tessellatorConfig.coarseTessellationRate;
     params.fineTessellationRate = m_tessellatorConfig.fineTessellationRate;
     params.cameraPos = m_tessellatorConfig.camera->GetEye();
-    params.aabb = subdivisionSurface.m_aabb * localToWorld;
+    params.aabb = scene.GetSubdAabb(instance) * localToWorld;
     params.enableBackfaceVisibility = m_tessellatorConfig.enableBackfaceVisibility;
     params.enableFrustumVisibility = m_tessellatorConfig.enableFrustumVisibility;
     params.enableHiZVisibility = m_tessellatorConfig.enableHiZVisibility && m_tessellatorConfig.zbuffer != nullptr;
@@ -822,7 +806,7 @@ void ClusterTessellator::ComputeInstanceClusterTiling(ClusterTessAccels& accels,
     
     auto bindingSetDesc = nvrhi::BindingSetDesc()
         .addItem(nvrhi::BindingSetItem::ConstantBuffer(0, m_computeClusterTilingParamsBuffer))
-        .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(0, subdivisionSurface.m_positionsBuffer))
+        .addItem(scene.GetSubdPositions(0, instance))
         .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(1, subdivisionSurface.m_surfaceToMaterialIndexBuffer))
         .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(2, scene.GetMaterialBuffer()))
         .addItem(nvrhi::BindingSetItem::StructuredBuffer_SRV(3, subdivisionSurface.m_vertexDeviceData.surfaceDescriptors))
@@ -849,7 +833,7 @@ void ClusterTessellator::ComputeInstanceClusterTiling(ClusterTessAccels& accels,
         .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(3, accels.clusterShadingDataBuffer))
         .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(4, m_clasIndirectArgDataBuffer))
         .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(5, accels.clasPtrsBuffer))
-        .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(6, subdivisionSurface.m_vertexDeviceData.patchPoints))
+        .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(6, scene.GetSubdPatchPoints(instance)))
         .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(7, subdivisionSurface.m_texcoordDeviceData.patchPoints));
 #if ENABLE_SHADER_DEBUG
     bindingSetDesc.addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(8, m_debugBuffer));
@@ -902,7 +886,8 @@ void ClusterTessellator::ComputeInstanceClusterTiling(ClusterTessAccels& accels,
                 macros.push_back(donut::engine::ShaderMacro("SURFACE_TYPE", toString(shaderPermutation.surfaceType())));
 
                 nvrhi::ShaderDesc tilingDesc(nvrhi::ShaderType::Compute);
-                nvrhi::ShaderHandle shader = m_shaderFactory.CreateShader("cluster_tess/compute_cluster_tiling.hlsl", "main", &macros, tilingDesc);
+                nvrhi::ShaderHandle shader = m_shaderFactory.CreateShader(
+                    GetClusterApiShaderPath(m_device, "cluster_tess/compute_cluster_tiling.hlsl").c_str(), "main", &macros, tilingDesc);
 
                 auto computePipelineDesc = nvrhi::ComputePipelineDesc()
                     .setComputeShader(shader)
@@ -1043,6 +1028,52 @@ void ClusterTessellator::CopyClusterOffset(uint32_t instanceIndex,
     commandList->dispatch(1, 1, 1);
 }
 
+void ClusterTessellator::UpdateTessRate(uint32_t tessCounterIndex, nvrhi::ICommandList* commandList)
+{
+    nvrhi::utils::ScopedMarker marker(commandList, "ClusterTessellator::UpdateTessRate");
+
+    // Uniform mode ignores the rates, so there is nothing to adapt.
+    const UpdateTessRateParams params = {
+        .slot = tessCounterIndex,
+        .prevSlot = (tessCounterIndex + kFrameCount - 1) % kFrameCount,
+        .prev2Slot = (tessCounterIndex + kFrameCount - 2) % kFrameCount,
+        .numPrevBuilds = std::min(m_buildAccelFrameIndex, 2u),
+        .maxClusters = m_maxClusters,
+        .maxVertices = m_maxVertices,
+        .maxClasBlocks = uint32_t(m_maxClasBytes / size_t(cluster::kClasByteAlignment)),
+        .enable = m_tessellatorConfig.enableAdaptiveTessRate &&
+            m_tessellatorConfig.tessMode != TessellatorConfig::AdaptiveTessellationMode::UNIFORM,
+    };
+
+    auto bindingSetDesc = nvrhi::BindingSetDesc()
+        .addItem(nvrhi::BindingSetItem::StructuredBuffer_UAV(0, m_tessellationCountersBuffer))
+        .addItem(nvrhi::BindingSetItem::PushConstants(0, sizeof(UpdateTessRateParams)));
+
+    nvrhi::BindingSetHandle bindingSet;
+    if (!nvrhi::utils::CreateBindingSetAndLayout(m_device, nvrhi::ShaderType::Compute, 0, bindingSetDesc, m_updateTessRateBL, bindingSet))
+    {
+        log::fatal("Failed to create binding set and layout for update_tess_rate shader");
+    }
+
+    if (!m_updateTessRatePSO)
+    {
+        nvrhi::ShaderHandle shader = m_shaderFactory.CreateShader("cluster_tess/update_tess_rate.hlsl", "main", nullptr, nvrhi::ShaderType::Compute);
+
+        auto computePipelineDesc = nvrhi::ComputePipelineDesc()
+            .setComputeShader(shader)
+            .addBindingLayout(m_updateTessRateBL);
+
+        m_updateTessRatePSO = m_device->createComputePipeline(computePipelineDesc);
+    }
+
+    auto state = nvrhi::ComputeState()
+        .setPipeline(m_updateTessRatePSO)
+        .addBindingSet(bindingSet);
+    commandList->setComputeState(state);
+    commandList->setPushConstants(&params, sizeof(params));
+    commandList->dispatch(1, 1, 1);
+}
+
 void ClusterTessellator::BuildBlasFromClas(ClusterTessAccels& accels, std::span<Instance const> instances, nvrhi::ICommandList* commandList)
 {
     //// Allocate and build BLASes
@@ -1104,7 +1135,7 @@ bool ClusterTessellator::UpdateMemoryAllocations(ClusterTessAccels& accels, uint
 
     // Reallocate memory if settings changed
     size_t maxClusterBlocks = (m_tessellatorConfig.memorySettings.clasBufferBytes + (size_t(cluster::kClasByteAlignment) - 1ull)) / size_t(cluster::kClasByteAlignment);
-    maxClusterBlocks = std::max(1ull, maxClusterBlocks);
+    maxClusterBlocks = std::max<size_t>(1, maxClusterBlocks);
     size_t maxClasBytes = size_t(cluster::kClasByteAlignment) * maxClusterBlocks;
 
     // Calculate max vertices based on vertex buffer bytes (same for positions and normals since both are float3)
@@ -1148,6 +1179,11 @@ bool ClusterTessellator::UpdateMemoryAllocations(ClusterTessAccels& accels, uint
 
         m_copyClusterOffsetParamsBuffer = m_device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(
             sizeof(CopyClusterOffsetParams), "CopyClusterOffsetParams", m_numInstances * ClusterTessDispatchType::NumTypes * kFrameCount));
+        // Written per instance (tiling: per surface type) every frame; Vulkan needs a version for each in flight.
+        m_computeClusterTilingParamsBuffer = m_device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(
+            sizeof(ComputeClusterTilingParams), "ComputeClusterTilingParams", m_numInstances * ClusterTessDispatchType::NumTypes * kFrameCount));
+        m_fillClustersParamsBuffer = m_device->createBuffer(nvrhi::utils::CreateVolatileConstantBufferDesc(
+            sizeof(FillClustersParams), "FillClustersParams", m_numInstances * kFrameCount));
 
         m_clusterOffsetCountsBuffer.Create(m_numInstances * ClusterTessDispatchType::NumTypes, "ClusterOffsets", m_device);
         nvrhi::BufferDesc dispatchIndirectDesc =
@@ -1195,7 +1231,7 @@ bool ClusterTessellator::UpdateMemoryAllocations(ClusterTessAccels& accels, uint
         // Vulkan requires BUILD_INPUT_READ_ONLY usage on the instantiate op's
         // srcInfosArray, same rule as the buffer above.
         nvrhi::BufferDesc clasIndirectArgDataDesc =
-            GetGenericDesc(m_maxClusters, sizeof(cluster::IndirectInstantiateTemplateArgs),
+            GetGenericDesc(m_maxClusters, sizeof(cluster::nv::IndirectInstantiateTemplateArgs),
                            "indirect arg data");
         clasIndirectArgDataDesc.isAccelStructBuildInput = true;
         m_clasIndirectArgDataBuffer.Create(clasIndirectArgDataDesc, m_device);
@@ -1263,6 +1299,20 @@ bool ClusterTessellator::UpdateMemoryAllocations(ClusterTessAccels& accels, uint
     return true;
 }
 
+uint64_t ClusterTessellator::GetWorkingBufferBytes(const ClusterTessAccels& accels) const
+{
+    return m_tessellationCountersBuffer.GetVramBytes()
+         + m_fillClustersDispatchIndirectBuffer.GetVramBytes()
+         + m_clusterOffsetCountsBuffer.GetVramBytes()
+         + m_gridSamplersBuffer.GetVramBytes()
+         + m_blasFromClasIndirectArgsBuffer.GetVramBytes()
+         + rtxmg::BufferVramBytes(m_templateBuffers.dataBuffer)
+         + m_templateBuffers.addressesBuffer.GetVramBytes()
+         + m_templateBuffers.instantiationSizesBuffer.GetVramBytes()
+         + accels.blasPtrsBuffer.GetVramBytes()
+         + accels.blasSizesBuffer.GetVramBytes();
+}
+
 void ClusterTessellator::BuildAccel(const RTXMGScene& scene, const TessellatorConfig& config,
     ClusterTessAccels& accels, ClusterTessStatistics& stats, uint32_t frameIndex, nvrhi::ICommandList* commandList)
 {
@@ -1285,6 +1335,7 @@ void ClusterTessellator::BuildAccel(const RTXMGScene& scene, const TessellatorCo
     // Clear tessellation counters for this frame
     TessellationCounters tessCounters = {};
     m_tessellationCountersBuffer.UploadElement(tessCounters, tessCounterIndex, commandList);
+    UpdateTessRate(tessCounterIndex, commandList);
 
     commandList->clearBufferUInt(m_clusterOffsetCountsBuffer, 0);
     commandList->clearBufferUInt(m_fillClustersDispatchIndirectBuffer, 0);
@@ -1380,6 +1431,11 @@ void ClusterTessellator::BuildAccel(const RTXMGScene& scene, const TessellatorCo
     // Async read of counters
     auto counterBufferData = m_tessellationCountersBuffer.Download(commandList, true);
     TessellationCounters counters = counterBufferData[(tessCounterIndex + 1) % kFrameCount];
+    stats.tessRateScale = counters.rateScale > 0.f ? counters.rateScale : 1.f;
+    stats.tessRateAdjusted = counters.rateAdjusted != 0;
+    stats.clusterRateScale = counters.rateScale > 0.f ? counters.clusterRateScale : 1.f;
+    stats.clasRateScale = counters.rateScale > 0.f ? counters.clasRateScale : 1.f;
+    stats.vertexRateScale = counters.rateScale > 0.f ? counters.vertexRateScale : 1.f;
 
     // Record the desired required memory instead of the max
     stats.desired.m_numTriangles = counters.desiredTriangles;
@@ -1388,9 +1444,10 @@ void ClusterTessellator::BuildAccel(const RTXMGScene& scene, const TessellatorCo
     stats.desired.m_vertexNormalsBufferSize = m_tessellatorConfig.enableVertexNormals ? 
         (accels.clusterVertexNormalsBuffer.GetElementBytes() * counters.desiredVertices) : 0;
     stats.desired.m_clasSize = counters.DesiredClasBytes();
-    stats.desired.m_clusterDataSize = (m_clustersBuffer.GetElementBytes() + 
+    stats.desired.m_clusterDataSize = (m_clustersBuffer.GetElementBytes() +
         accels.clusterShadingDataBuffer.GetElementBytes() +
-        accels.clasPtrsBuffer.GetElementBytes()) * counters.desiredClusters;
+        accels.clasPtrsBuffer.GetElementBytes() +
+        m_clasIndirectArgDataBuffer.GetElementBytes()) * counters.desiredClusters;
     stats.desired.m_blasSize = m_createBlasSizeInfo.resultMaxSizeInBytes;
     stats.desired.m_blasScratchSize = m_createBlasSizeInfo.scratchSizeInBytes;
 
@@ -1400,7 +1457,8 @@ void ClusterTessellator::BuildAccel(const RTXMGScene& scene, const TessellatorCo
     stats.allocated.m_vertexBufferSize = accels.clusterVertexPositionsBuffer.GetBytes();
     stats.allocated.m_vertexNormalsBufferSize = accels.clusterVertexNormalsBuffer.GetBytes();
     stats.allocated.m_clasSize = accels.clasBuffer.GetBytes();
-    stats.allocated.m_clusterDataSize = m_clustersBuffer.GetBytes() + accels.clusterShadingDataBuffer.GetBytes() + accels.clasPtrsBuffer.GetBytes();
+    stats.allocated.m_clusterDataSize = m_clustersBuffer.GetBytes() + accels.clusterShadingDataBuffer.GetBytes()
+        + accels.clasPtrsBuffer.GetBytes() + m_clasIndirectArgDataBuffer.GetBytes();
     stats.allocated.m_blasSize = accels.blasBuffer.GetBytes();
     stats.allocated.m_blasScratchSize = m_createBlasSizeInfo.scratchSizeInBytes;
 

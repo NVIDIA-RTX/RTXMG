@@ -10,23 +10,30 @@
  * its affiliates is strictly prohibited.
  */
 
+#include <donut/shaders/binding_helpers.hlsli>
 #include "lerp_keyframes_params.h"
 
-StructuredBuffer<float3> kf0 : register(t0);
-StructuredBuffer<float3> kf1 : register(t1);
+StructuredBuffer<float3>            keyframes : register(t0);
+StructuredBuffer<LerpKeyFramesPose> poses     : register(t1);
 
-RWStructuredBuffer<float3> dst : register(u0);
+RWStructuredBuffer<float3> posed     : register(u0);
+RWStructuredBuffer<float3> posedPrev : register(u1);
 
-ConstantBuffer<LerpKeyFramesParams> g_lerpParams: register(b0);
+DECLARE_PUSH_CONSTANTS(LerpKeyFramesConstants, g_constants, 0, 0);
 
-[numthreads(32, 1, 1)]
+// x: vertex, y: pose.  Every pose of one mesh in a single dispatch.
+[numthreads(64, 1, 1)]
 void main(uint3 threadIdx : SV_DispatchThreadID)
 {
     const uint32_t vertexIndex = threadIdx.x;
-    if (vertexIndex >= g_lerpParams.numVertices)
+    if (vertexIndex >= g_constants.numVertices)
         return;
-    const float3 v0 = kf0[vertexIndex];
-    const float3 v1 = kf1[vertexIndex];
 
-    dst[vertexIndex] = lerp(v0, v1, g_lerpParams.animTime);
+    const LerpKeyFramesPose pose = poses[threadIdx.y];
+    const float3 v0 = keyframes[pose.f0 * g_constants.numVertices + vertexIndex];
+    const float3 v1 = keyframes[pose.f1 * g_constants.numVertices + vertexIndex];
+
+    const uint32_t dst = threadIdx.y * g_constants.poseStride + vertexIndex;
+    posedPrev[dst] = posed[dst];
+    posed[dst]     = lerp(v0, v1, pose.blend);
 }

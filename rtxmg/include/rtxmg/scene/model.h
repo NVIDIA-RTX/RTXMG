@@ -31,6 +31,11 @@ struct Instance
 
     uint32_t meshID = ~uint32_t(0);
 
+    // Keyframe-track offset in frames; instances of an animated mesh with the
+    // same offset share one pose (~0 for static meshes).
+    float    frameOffset = 0.f;
+    uint32_t poseID      = ~uint32_t(0);
+
     void UpdateLocalTransform();
 };
 

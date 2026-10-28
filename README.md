@@ -48,7 +48,7 @@ scene may use both.
   whose source geometry does not fit in VRAM
 * BLAS sharing, caching and merging to keep acceleration-structure build cost flat as
   instance counts rise
-* Cluster BVH build using NVAPI for DX12, and the VK_NV_cluster_acceleration_structure extension for Vulkan.
+* Cluster BVH build using DXR clusters or NVAPI for DX12, and the VK_NV_cluster_acceleration_structure extension for Vulkan.
 * Hierarchical Z-buffer for reducing detail in occluded geometry
 * DLSS-RR (Ray Reconstruction) denoising and upscaling
 
@@ -105,10 +105,11 @@ the UI panels, the Inspector, the Profiler, and the VRAM Budget window; see
 ## Requirements
 
 To Run:
-- Windows 10
-- NVIDIA RTX GPU (10 GB VRAM or greater)
-- GeForce Game Ready Driver 570 or later (R615 or later on Windows on Arm64)
+- Windows 10 version 1909 or later
+- NVIDIA RTX GPU for the NVAPI and Vulkan paths (10 GB VRAM recommended)
+- NVIDIA driver 621.01 or later
 - DirectX Raytracing 1.1 API or later
+- Windows Developer Mode, for [DXR clusters](#dxr-clusters); without it the sample uses NVAPI
 
 The Cluster LOD path sizes its pools from fixed budgets: 2048 MB of streamed geometry
 and 2048 MB of CLAS by default, plus a 4096 MB material-texture budget
@@ -120,7 +121,7 @@ To Build:
 - CMake v4.1+
 - Windows 10 SDK 10.0.20348.0 or later
 - MSVC Compiler 19.43.34810 (Visual Studio 2022 17.13) or later
-- For Windows: DirectX 12 AgilitySDK will be fetched automatically
+- For Windows: the preview D3D12 Agility SDK and its matching DXC are fetched automatically
 - For Vulkan: Vulkan SDK 1.4.313 or later
 
 ## Folder Structure
@@ -143,8 +144,8 @@ To Build:
 
 ## Build
 
-At the moment, only Windows builds are supported. Both the D3D12 and the Vulkan
-back-end are supported there; pass `-vk` to run on Vulkan.
+Windows builds support both the D3D12 and the Vulkan back-end; pass `-vk` to run on
+Vulkan.
 
 1. Clone the repository **with all submodules recursively**:
    
@@ -183,6 +184,36 @@ To package both architectures in one zip, configure the x64 build with
 `-DRTXMG_PACKAGE_ARM64_BUILD_DIR=<path to build_arm64>`, build both, and run
 `cpack -C RelWithDebInfo` in `build`. The zip holds `bin` and `bin_arm64` next to one
 shared `assets` folder, and the `run_*.bat` scripts pick the right one for the machine.
+
+### DXR Clusters
+
+On D3D12 the sample builds its cluster acceleration structures through the native DXR
+cluster API and reads cluster data through the Shader Model 6.10 `ClusterID()` and
+`TriangleObjectPositions()` intrinsics. These are experimental in the 1.722 preview
+D3D12 Agility SDK, which CMake fetches from NuGet together with the matching preview DXC,
+so running on them needs Windows Developer Mode.
+
+The NVAPI path stays in the build, and the sample picks one at startup: DXR clusters
+when the driver and Developer Mode allow it, NVAPI otherwise. `--cluster-api dxr` or
+`--cluster-api nvapi` forces one; the window title and the log name the API in use.
+
+To build with NVAPI only, against the retail Agility SDK:
+
+```
+cmake CMakeLists.txt -B ./build -DNVRHI_D3D12_WITH_DXRCLUSTER=OFF
+```
+
+When switching an existing build, delete the compiled shaders in `bin/shaders` first,
+since changing the option alone does not rebuild them. A locally extracted 1.722 package
+can be used instead of the NuGet download by pointing `DONUT_D3D_AGILITY_SDK_PATH` at it.
+
+> [!WARNING]
+> **Known issue:** with the 1.722 preview Agility SDK, the NVAPI cluster intrinsics return
+> invalid data under D3D12 GPU-based validation (`-gd`), which leads to out-of-bounds
+> validation errors and corrupted rendering. With `--cluster-api nvapi -gd` the path
+> tracing shader uses SM 6.10 DXR cluster intrinsics instead, which needs Windows
+> Developer Mode; without it the sample warns and the issue remains. Builds with
+> `-DNVRHI_D3D12_WITH_DXRCLUSTER=OFF` are not affected.
 
 
  ## User Interface

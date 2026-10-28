@@ -172,6 +172,7 @@ Json::Value TextureMemToJson(const TextureMemStats& t)
     v["budgetBytes"]          = Json::UInt64(t.budgetBytes);
     v["loadedBytes"]          = Json::UInt64(t.loadedBytes);
     v["loadedOtherBytes"]     = Json::UInt64(t.loadedOtherBytes);
+    v["vramBytes"]            = Json::UInt64(t.vramBytes);
     v["fullBytes"]            = Json::UInt64(t.FullBytes());
     return v;
 }
@@ -290,10 +291,15 @@ bool DumpToJson(const fs::path& path, const RunIdentity& run)
     vramJson["clodGeometry"]    = Json::UInt64(vram.clodGeometry);
     vramJson["clodClas"]        = Json::UInt64(vram.clodClas);
     vramJson["clodCachedBlas"]  = Json::UInt64(vram.clodCachedBlas);
+    vramJson["clodMetadata"]    = Json::UInt64(vram.clodMetadata);
     vramJson["tessVertices"]    = Json::UInt64(vram.tessVertices);
     vramJson["tessClas"]        = Json::UInt64(vram.tessClas);
     vramJson["tessClusterData"] = Json::UInt64(vram.tessClusterData);
+    vramJson["tessSurfaces"]    = Json::UInt64(vram.tessSurfaces);
     vramJson["blas"]            = Json::UInt64(vram.blas);
+    vramJson["blasUsed"]        = Json::UInt64(vram.blasUsed);
+    vramJson["asScratch"]       = Json::UInt64(vram.asScratch);
+    vramJson["dlss"]            = Json::UInt64(vram.dlss);
     vramJson["renderTargets"]   = Json::UInt64(vram.renderTargets);
     vramJson["accounted"]       = Json::UInt64(vram.Accounted());
     vramJson["driverValid"]     = vram.driverValid;

@@ -20,6 +20,7 @@
 using namespace donut::math;
 
 #include "rtxmg/utils/buffer.h"
+#include "rtxmg/utils/cluster_operation.h"
 #include "rtxmg/cluster_tess/tessellator_config.h"
 // clang-format on
 
@@ -33,7 +34,7 @@ struct ClusterTessAccels
 
     RTXMGBuffer<nvrhi::GpuVirtualAddress> clasPtrsBuffer;  // address of each CLAS header in clasBuffer
     RTXMGBuffer<nvrhi::GpuVirtualAddress> blasPtrsBuffer;  // handles in device memory
-    RTXMGBuffer<uint32_t> blasSizesBuffer;
+    ClusterOperationSizesBuffer blasSizesBuffer;
 
     // -------------------------------------------------------------------------
     // Cluster data buffer for shading information
@@ -67,4 +68,13 @@ struct ClusterTessStatistics
 
     BufferStatistics desired;
     BufferStatistics allocated;
+
+    // Adaptive scale on the tessellation rates of the build `desired` was measured
+    // on, and whether that build changed it.
+    float tessRateScale = 1.f;
+    bool  tessRateAdjusted = false;
+    // The scale each budget asks for on its own; tessRateScale is the smallest.
+    float clusterRateScale = 1.f;
+    float clasRateScale = 1.f;
+    float vertexRateScale = 1.f;
 };

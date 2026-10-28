@@ -15,6 +15,7 @@
 #pragma once
 
 #include "rtxmg_demo.h"
+#include "cluster_lod_budgets.h"
 #include "rtxmg/cluster_tess/tessellator_config.h"
 #include "rtxmg/scene/scene.h"
 
@@ -185,6 +186,11 @@ struct Args : SceneArgs
 
     float fineTessellationRate = TessellatorConfig::kDefaultFineTessellationRate;
     float coarseTessellationRate = TessellatorConfig::kDefaultCoarseTessellationRate;
+
+    // Adaptive tessellation rate: divide the tessellation rates while the
+    // cluster_tess budgets run hot (same deadband as adaptiveLodError; never
+    // finer than the rates above).  --no-adaptive-tess-rate opts out.
+    bool adaptiveTessRate = true;
     ClusterTessPattern clusterPattern = ClusterTessPattern::SLANTED;
 
     // Cluster-LoD: target screen-space error (in pixels) at which the LoD
@@ -269,38 +275,12 @@ struct Args : SceneArgs
     // the HiZ be screenshotted headless.
     bool showOcclusionDepth = false;
 
-    // Optional CLAS-pool cap (MB) supplied as "--linearalloc <MB>".  0 means
-    // keep StreamingConfig's default (maxClasMegaBytes).  Constrains the
-    // compaction allocator's pool to test that defrag bounds CLAS usage to the
-    // resident working set under a tight budget.
-    uint32_t clasPoolOverrideMB = 0;
-
-    // Streaming request throttle. 0 means use StreamingConfig's default.
-    uint32_t maxFrameLoadRequests = 0;
+    ClusterLodBudgets clodBudgets;
 
     // Mantissa bits the CLAS builder drops from each vertex position
     // (--claspositionbits). Shrinks the CLAS pool at the cost of position
     // precision; a --compress bake raises it to compressionPosDropBits for free.
     uint32_t clasPositionTruncateBits = 0;
-
-    // Max simultaneously-resident cluster-LoD groups (residency slot-count cap).
-    // 0 = use StreamingConfig's default. Raise for large scenes whose framed
-    // full-detail working set exceeds the default (else streaming wedges with the
-    // byte pools under budget).
-    uint32_t maxResidentGroups = 0;
-
-    // Cluster-LoD streaming byte pools, in MB.  0 = use StreamingConfig's default
-    // (2048 each).  Both size GPU pools at init, so they only land on a scene
-    // (re)load -- the same path the UI's budget fields commit through.
-    uint32_t maxGeometryMB = 0;
-    uint32_t maxClasMB     = 0;
-
-    // Per-frame render-cluster budget exponent: the traversal pass can emit up to
-    // (1u << renderClusterBits) clusters/frame; exceeding it drops clusters →
-    // flicker ("Render cluster budget exceeded").  Defaults to 20 (1M), matching
-    // vk_lod_clusters.  Clamped to [16,25].  Init-time budget: committing a new
-    // value in the UI re-initializes the cluster-LoD resources.
-    uint32_t renderClusterBits = 20;
 
     // Diagnostic: verbose Cluster-LoD streaming/traversal/BLAS readbacks.
     // Forces extra readbacks and, in some cases, wait-for-idle; slow.
@@ -392,6 +372,12 @@ struct Args : SceneArgs
     // step can back an image or counter baseline.
     uint32_t dollyFrames = 0;
 
+    // --anim-step <K>: advance subd animation by K keyframes per rendered frame
+    // instead of by wall-clock time, so a run is reproducible.  0 = wall-clock.
+    float animStep = 0.f;
+    // --anim-dump <dir>: per frame, write render-res albedo + motion vectors as .npy.
+    std::string animDumpDir;
+
     // --blas-toggle-sweep: cycle the BLAS sharing/caching toggles every N frames
     // once streaming has settled, reproducing the UI checkboxes headlessly.  The
     // settle delay matters: a toggle edge is only interesting against a populated
@@ -426,6 +412,8 @@ struct Args : SceneArgs
     bool gpuValidation = false;
     bool aftermath = false;
     bool enableStreamlineLog = false;
+    enum class ClusterApiRequest { Auto, Dxr, Nvapi };
+    ClusterApiRequest clusterApi = ClusterApiRequest::Auto;
     bool enableAccelBuildLogging = false;
     bool enableTimeView = false;
     bool vsync = false;

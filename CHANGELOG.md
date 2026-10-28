@@ -1,5 +1,72 @@
 # RTX Mega Geometry SDK Change Log
 
+## 2.2.0
+
+Adds **DXR Clusters** support through the preview D3D12 Agility SDK. The D3D12 back-end can
+build its cluster acceleration structures through the native DXR cluster API as well as
+NVAPI, and shaders read cluster data through the Shader Model 6.10 `ClusterID()` and
+`TriangleObjectPositions()` intrinsics. See
+[DXR Clusters](README.md#dxr-clusters).
+
+DXR Clusters
+
+* Built by default; CMake fetches the 1.722.0-preview Agility SDK from NuGet and the
+  matching v1.10.2605.37 preview DXC. Running it needs NVIDIA driver 621.01 or later and
+  Windows Developer Mode, and the sample falls back to NVAPI otherwise.
+  `-DNVRHI_D3D12_WITH_DXRCLUSTER=OFF` builds against the retail Agility SDK instead
+* A DXR cluster build keeps the NVAPI path: by default it uses DXR clusters when the
+  device supports them and NVAPI otherwise. `--cluster-api dxr|nvapi` forces one, and the
+  window title and log name the API in use. The same build still runs on Vulkan with `-vk`
+* Known issue: on the 1.722 runtime, the NVAPI cluster intrinsics return invalid data
+  under D3D12 GPU-based validation (`-gd`). With `--cluster-api nvapi -gd` the path
+  tracing shader uses SM 6.10 DXR cluster intrinsics instead when Windows Developer Mode
+  is on
+
+Platform
+
+* Build on Linux with the Vulkan back-end; DLSS is Windows-only, since Streamline ships
+  Windows binaries only
+* Mark the wave-dependent compute shaders as 32-lane waves, so D3D12 runs on any device
+  that supports 32-lane waves
+* Disable use of the NVAPI shader extensions in the path tracer on non-NVIDIA GPUs
+* Update Donut and NVRHI
+
+Subdivision Surfaces
+
+* Instance subdivision meshes: an OBJ referenced by several `.scene.json` nodes loads
+  once, and each node can offset its animation; adds the `amy_instanced` scene
+* Adapt the fine and coarse tessellation rates to the tessellation budgets on the GPU,
+  stepping down when cluster, CLAS or vertex memory load passes 85% and recovering below
+  60%; on by default, `--no-adaptive-tess-rate` turns it off. The Adaptive readout names
+  the limiting budget
+* Hold the last keyframe at the end of an animation loop instead of blending it into
+  frame 0
+
+Cluster LOD
+
+* Pack per-geometry LOD metadata into shared buffers and build it in parallel at scene
+  load; Zorah's metadata build drops from 2465 to 406 ms
+* Import a glTF referenced by several `.scene.json` nodes once
+* Color the adaptive error readout by streaming load, matching the tessellation readout
+
+UI and Profiling
+
+* Improve tracking of VRAM usage in the VRAM Budget window: it counts occupied VRAM
+  rather than packed sizes, and now tracks AS build scratch, DLSS and DLSS-RR, BLAS and
+  TLAS, envmap sampling tables and subdivision surfaces
+* Add a Shot List window to jump the camera between saved positions, save the current
+  camera and run captures without exiting
+* Edit the camera string and the field of view in the Camera section
+
+Bug Fixes
+
+* Vulkan screenshots were sRGB-encoded twice
+* Applying a texture setting in the VRAM Budget window reset the Cluster LOD streaming
+  budgets
+* Vulkan overflowed its per-instance tessellation constants past ~5 subdivision instances
+* Loading a scene without subdivision surfaces kept the previous scene's tessellation
+  stats
+
 ## 2.1.0
 
 Platform

@@ -54,7 +54,8 @@ class IXAudio2MasteringVoice;
 typedef uint32_t HRESULT;
 typedef uint8_t BYTE;
 #define S_OK 0
-#define FAILED(R) ((HRESULT)(R) < 0)
+// FAudio returns 0 on success and an unsigned error code otherwise.
+#define FAILED(R) ((HRESULT)(R) != 0)
 
 #define CoInitializeEx(FOO,BAR) S_OK /* not really using COM, pretend we're fine */
 #define COINIT_MULTITHREADED
@@ -131,9 +132,9 @@ public:
       const XAUDIO2_VOICE_SENDS *pSendList = NULL,
       const XAUDIO2_EFFECT_CHAIN *pEffectChain = NULL)
   {
-    FAudioSourceVoice* faudiosv;
+    FAudioSourceVoice* faudiosv = nullptr;
     HRESULT rtn = FAudio_CreateSourceVoice(_faudio,&faudiosv,pSourceFormat,Flags,MaxFrequencyRatio,pCallback,pSendList,pEffectChain);
-    *ppSourceVoice = IXAudio2SourceVoice::_XAudio2SourceVoiceCreateFromFAudioSourceVoice(faudiosv);
+    *ppSourceVoice = rtn == 0 ? IXAudio2SourceVoice::_XAudio2SourceVoiceCreateFromFAudioSourceVoice(faudiosv) : nullptr;
     return rtn;
   }
   HRESULT CreateMasteringVoice(
@@ -144,9 +145,9 @@ public:
       uint32_t DeviceIndex = 0,
       const XAUDIO2_EFFECT_CHAIN *pEffectChain = NULL)
   {
-    FAudioMasteringVoice* faudiomv;
+    FAudioMasteringVoice* faudiomv = nullptr;
     HRESULT rtn = FAudio_CreateMasteringVoice(_faudio,&faudiomv,InputChannels,InputSampleRate,Flags,DeviceIndex,pEffectChain);
-    *ppMasteringVoice = IXAudio2MasteringVoice::_XAudio2MasteringVoiceCreateFromFAudioMasteringVoice(faudiomv);
+    *ppMasteringVoice = rtn == 0 ? IXAudio2MasteringVoice::_XAudio2MasteringVoiceCreateFromFAudioMasteringVoice(faudiomv) : nullptr;
     return rtn;
   }
 
@@ -160,9 +161,9 @@ static HRESULT XAudio2Create(
   XAUDIO2_PROCESSOR XAudio2Processor = XAUDIO2_DEFAULT_PROCESSOR
 )
 {
-  FAudio* faudio;
+  FAudio* faudio = nullptr;
   HRESULT rtn = FAudioCreate(&faudio,Flags,XAudio2Processor);
-  *ppXAudio2 = IXAudio2::_XAudio2CreateFromFAudio(faudio);
+  *ppXAudio2 = rtn == 0 ? IXAudio2::_XAudio2CreateFromFAudio(faudio) : nullptr;
   return rtn;
 };
 

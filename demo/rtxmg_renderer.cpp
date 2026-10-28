@@ -33,8 +33,9 @@ using namespace donut::math;
 #include "gbuffer.h"
 
 #include "rtxmg/utils/bindless_layout.h"
+#include "rtxmg/utils/cluster_operation.h"
 #include "rtxmg/utils/debug.h"
-#include "rtxmg/utils/texture_bytes.h"
+#include "rtxmg/utils/vram_bytes.h"
 #include "rtxmg/scene/scene.h"
 #include "rtxmg/scene/camera.h"
 #include "rtxmg/cluster_lod/baker.h"
@@ -49,6 +50,9 @@ using namespace donut::math;
 RTXMGRenderer::RTXMGRenderer(Options const& opts)
     : m_options(opts), m_params(opts.params)
 {
+    m_hlslExtensionsSupported = GetDevice()->getGraphicsAPI() == nvrhi::GraphicsAPI::D3D12 &&
+        GetDevice()->queryFeatureSupport(nvrhi::Feature::HlslExtensionUAV);
+
     std::filesystem::path frameworkShaderPath =
         app::GetDirectoryWithExecutable() / "shaders/framework" /
         app::GetShaderTypeName(GetDevice()->getGraphicsAPI());
@@ -461,28 +465,45 @@ void RTXMGRenderer::CreateOutputs(nvrhi::ICommandList *commandList)
 
 uint64_t RTXMGRenderer::GetRenderTargetBytes() const
 {
+    nvrhi::IDevice* device = GetDevice();
     uint64_t bytes = 0;
     for (const nvrhi::TextureHandle& tex : m_outputTextures)
-        bytes += rtxmg::TextureGpuBytes(tex.Get());
-    bytes += rtxmg::TextureGpuBytes(m_displayTexture.Get());
+        bytes += rtxmg::TextureVramBytes(device, tex);
+    bytes += rtxmg::TextureVramBytes(device, m_displayTexture);
 
-    if (m_hitResultBuffer)
-        bytes += m_hitResultBuffer->getDesc().byteSize;
-    if (m_timeViewBuffer)
-        bytes += m_timeViewBuffer->getDesc().byteSize;
+    bytes += rtxmg::BufferVramBytes(m_hitResultBuffer);
+    bytes += rtxmg::BufferVramBytes(m_timeViewBuffer);
 
     if (m_zbuffer)
     {
-        bytes += rtxmg::TextureGpuBytes(m_zbuffer->GetCurrent().Get());
+        bytes += rtxmg::TextureVramBytes(device, m_zbuffer->GetCurrent());
         for (int level = 0; level < m_zbuffer->GetNumHiZLODs(); ++level)
-            bytes += rtxmg::TextureGpuBytes(m_zbuffer->GetHierarchyTexture(uint32_t(level)));
+            bytes += rtxmg::TextureVramBytes(device, m_zbuffer->GetHierarchyTexture(uint32_t(level)));
     }
     return bytes;
 }
 
 uint64_t RTXMGRenderer::GetEnvMapBytes() const
 {
-    return (m_envMap && m_envMap->texture) ? rtxmg::TextureGpuBytes(m_envMap->texture->getDesc()) : 0;
+    if (!m_envMap || !m_envMap->texture)
+        return 0;
+    const PreprocessEnvMapResources& pre = m_preprocessEnvMapResources;
+    return rtxmg::TextureVramBytes(GetDevice(), m_envMap->texture)
+         + pre.m_conditionalFunc.GetVramBytes() + pre.m_conditionalCdf.GetVramBytes()
+         + pre.m_marginalFunc.GetVramBytes() + pre.m_marginalCdf.GetVramBytes();
+}
+
+uint64_t RTXMGRenderer::GetTlasBytes() const
+{
+    uint64_t bytes = m_instanceDescs.GetVramBytes();
+    if (m_topLevelAS)
+        bytes += GetDevice()->getAccelStructMemoryRequirements(m_topLevelAS).size;
+    return bytes;
+}
+
+uint64_t RTXMGRenderer::GetClusterTessWorkingBytes() const
+{
+    return m_clusterAccelBuilder && m_sceneAccels ? m_clusterAccelBuilder->GetWorkingBufferBytes(*m_sceneAccels) : 0;
 }
 
 void RTXMGRenderer::Launch(nvrhi::ICommandList* commandList,
@@ -588,6 +609,7 @@ void RTXMGRenderer::Launch(nvrhi::ICommandList* commandList,
         // Override settings
         params.colorMode = m_showMicroTriangles ? ColorMode::COLOR_BY_MICROTRI_ID : m_colorMode;
         params.shadingMode = m_showMicroTriangles ? ShadingMode::PRIMARY_RAYS : m_shadingMode;
+        params.enableTimeView = GetTimeView();
         commandList->writeBuffer(m_renderParamsBuffer, &params, sizeof(params));
 
         // Get the appropriate pipeline and shader table for current permutation
@@ -604,8 +626,10 @@ void RTXMGRenderer::Launch(nvrhi::ICommandList* commandList,
                     macros.push_back(engine::ShaderMacro("VERTEX_NORMALS", rtPermutation.isVertexNormalsEnabled() ? "1" : "0"));
                     macros.push_back(engine::ShaderMacro("CLUSTER_LOD_SHADING", std::to_string(rtPermutation.clusterLodShading())));
 
-                    nvrhi::ShaderLibraryHandle shaderLibrary =
-                        m_shaderFactory->CreateShaderLibrary("rtxmg_demo/rtxmg_demo_path_tracer.hlsl", &macros);
+                    const std::string pathTracer = m_options.forceDxrClusterIntrinsics
+                        ? "rtxmg_demo/rtxmg_demo_path_tracer_dxr.hlsl"
+                        : GetClusterApiShaderPath(GetDevice(), "rtxmg_demo/rtxmg_demo_path_tracer.hlsl");
+                    nvrhi::ShaderLibraryHandle shaderLibrary = m_shaderFactory->CreateShaderLibrary(pathTracer.c_str(), &macros);
 
                     if (!shaderLibrary)
                         return nullptr;
@@ -647,12 +671,19 @@ void RTXMGRenderer::Launch(nvrhi::ICommandList* commandList,
 
                     pipelineDesc.maxPayloadSize = sizeof(RayPayload);
                     pipelineDesc.maxRecursionDepth = m_params.ptMaxBounces + 1;
-                    pipelineDesc.hlslExtensionsUAV = int32_t(RTXMG_NVAPI_SHADER_EXT_SLOT);
+                    pipelineDesc.allowClusters = true;
+                    if (m_hlslExtensionsSupported)
+                        pipelineDesc.hlslExtensionsUAV = int32_t(RTXMG_NVAPI_SHADER_EXT_SLOT);
 
                     m_rayPipelines[index] = GetDevice()->createRayTracingPipeline(pipelineDesc);
 
                     if (!m_rayPipelines[index])
+                    {
+                        if (UsesDxrClusterOperations(GetDevice()))
+                            log::fatal("Failed to create the path tracing pipeline. Its DXR cluster shaders need "
+                                       "NVIDIA driver 621.01 or later. Run with --cluster-api nvapi or -vk instead.");
                         return nullptr;
+                    }
 
                     m_shaderTables[index] = m_rayPipelines[index]->createShaderTable();
 
@@ -851,7 +882,7 @@ void RTXMGRenderer::BlitFramebuffer(nvrhi::ICommandList* commandList, nvrhi::IFr
 
 void RTXMGRenderer::ResetSubframes()
 {
-    if (m_params.enableTimeView != 0 || m_params.denoiserMode == DenoiserMode::None)
+    if (GetTimeView() || m_params.denoiserMode == DenoiserMode::None)
     {
         // The denoiser really doesn't like it when its noise is related between frames.
         // Since we don't feed the accumulation buffer to the denoiser, it won't matter
@@ -893,7 +924,7 @@ void RTXMGRenderer::SetRenderCamera(Camera& camera, bool isCameraCut)
     }
 
     const uint32_t kBasePhaseCount = 8;
-    uint32_t phaseCount = uint32_t(std::ceilf(kBasePhaseCount * powf(float(m_displaySize.y) / float(m_renderSize.y), 2.0f)));
+    uint32_t phaseCount = uint32_t(std::ceil(kBasePhaseCount * powf(float(m_displaySize.y) / float(m_renderSize.y), 2.0f)));
     uint32_t index = (m_params.subFrameIndex % phaseCount) + 1;
     m_params.jitter = float2{ VanDerCorput(2, index), VanDerCorput(3, index) } - 0.5f;
 
@@ -975,20 +1006,23 @@ void RTXMGRenderer::SetTimeView(bool timeView)
 }
 
 void RTXMGRenderer::SceneFinishedLoading(std::shared_ptr<RTXMGScene> scene,
+                                          const ClusterLodBudgets& budgets,
                                           nvrhi::ICommandList* commandList)
 {
     m_bindingSet = nullptr;
     m_bindingCache->Clear();
     m_scene = scene;
+    m_clodBudgets = budgets;
     CreateAccelStructs(commandList);
     ResetSubframes();
     ResetDenoiser();
 }
 
-void RTXMGRenderer::ReinitAccelStructs(nvrhi::ICommandList* commandList)
+void RTXMGRenderer::ReinitAccelStructs(const ClusterLodBudgets& budgets, nvrhi::ICommandList* commandList)
 {
     if (!m_scene)
         return;
+    m_clodBudgets = budgets;
     // CreateAccelStructs rebuilds purely from m_scene: it releases the streaming
     // object (and its pools) and sizes a fresh one to the current StreamingConfig.
     m_bindingSet = nullptr;
@@ -1144,36 +1178,35 @@ void RTXMGRenderer::CreateAccelStructs(nvrhi::ICommandList* commandList)
         {
             donut::log::info("Cluster-LOD: --linearalloc enabled (compaction CLAS allocator)");
             streamingConfig.usePersistentClasAllocator = false;
-            if (m_clasPoolOverrideMB != 0)
+            if (m_clodBudgets.clasPoolOverrideMB != 0)
             {
-                donut::log::info("Cluster-LOD: CLAS pool capped to %u MB (compaction budget test)", m_clasPoolOverrideMB);
-                streamingConfig.maxClasMegaBytes = m_clasPoolOverrideMB;
+                donut::log::info("Cluster-LOD: CLAS pool capped to %u MB (compaction budget test)", m_clodBudgets.clasPoolOverrideMB);
+                streamingConfig.maxClasMegaBytes = m_clodBudgets.clasPoolOverrideMB;
             }
         }
-        if (m_maxFrameLoadRequests != 0)
+        if (m_clodBudgets.maxFrameLoadRequests != 0)
         {
-            donut::log::info("Cluster-LOD: maxPerFrameLoadRequests set to %u", m_maxFrameLoadRequests);
-            streamingConfig.maxPerFrameLoadRequests = m_maxFrameLoadRequests;
+            donut::log::info("Cluster-LOD: maxPerFrameLoadRequests set to %u", m_clodBudgets.maxFrameLoadRequests);
+            streamingConfig.maxPerFrameLoadRequests = m_clodBudgets.maxFrameLoadRequests;
         }
-        // Sidebar budget-slider overrides (0 = keep default).  Every budget sizes
-        // GPU pools at init, so a change only lands on the next scene reload.
-        if (m_maxResidentGroupsOverride != 0)
+        // 0 keeps the StreamingConfig default.
+        if (m_clodBudgets.maxResidentGroups != 0)
         {
-            donut::log::info("Cluster-LOD: maxGroups (resident) set to %u", m_maxResidentGroupsOverride);
-            streamingConfig.maxGroups = m_maxResidentGroupsOverride;
+            donut::log::info("Cluster-LOD: maxGroups (resident) set to %u", m_clodBudgets.maxResidentGroups);
+            streamingConfig.maxGroups = m_clodBudgets.maxResidentGroups;
         }
-        if (m_maxGeometryMBOverride != 0)
-            streamingConfig.maxGeometryMegaBytes = m_maxGeometryMBOverride;
-        if (m_geometryBlockMBOverride != 0)
-            streamingConfig.geometryBlockMegaBytes = m_geometryBlockMBOverride;
+        if (m_clodBudgets.maxGeometryMB != 0)
+            streamingConfig.maxGeometryMegaBytes = m_clodBudgets.maxGeometryMB;
+        if (m_clodBudgets.geometryBlockMB != 0)
+            streamingConfig.geometryBlockMegaBytes = m_clodBudgets.geometryBlockMB;
         // Pool must be at least one block — clamp here so GetStreamingConfig()
         // (and thus the UI's "Geometry pool" minimum) reflects the effective value.
         streamingConfig.maxGeometryMegaBytes =
             std::max(streamingConfig.maxGeometryMegaBytes, streamingConfig.geometryBlockMegaBytes);
-        if (m_maxClasMBOverride != 0)
-            streamingConfig.maxClasMegaBytes = m_maxClasMBOverride;
-        if (m_maxBlasCachingMBOverride != 0)
-            streamingConfig.maxBlasCachingMegaBytes = m_maxBlasCachingMBOverride;
+        if (m_clodBudgets.maxClasMB != 0)
+            streamingConfig.maxClasMegaBytes = m_clodBudgets.maxClasMB;
+        if (m_clodBudgets.maxBlasCachingMB != 0)
+            streamingConfig.maxBlasCachingMegaBytes = m_clodBudgets.maxBlasCachingMB;
         streamingConfig.clasPositionTruncateBits = m_clasPositionTruncateBits;
         if (m_debugClusterLod)
         {
@@ -1268,7 +1301,7 @@ void RTXMGRenderer::CreateAccelStructs(nvrhi::ICommandList* commandList)
                           m_shaderFactory.get(),
                           GetDevice(),
                           m_debugClusterLod,
-                          m_clusterLodRenderClusterBits);
+                          m_clodBudgets.renderClusterBits);
 
     // Reserved unconditionally on the streaming path (cheap: address arrays, not
     // the lazy pool) so caching stays a live sidebar toggle.
@@ -1618,7 +1651,7 @@ void RTXMGRenderer::UpdateAccelerationStructures(const TessellatorConfig &tessCo
         // Merging requires sharing + streaming.
         lodParams.useBlasMerging       = m_useStreaming && m_useBlasSharing && m_useBlasMerging;
         lodParams.blasCacheMinLevel    = m_blasCachingEnabledLevels;
-        lodParams.blasCacheMaxClusters = 1u << m_clusterLodRenderClusterBits;
+        lodParams.blasCacheMaxClusters = 1u << m_clodBudgets.renderClusterBits;
         lodParams.debugClusterLod      = m_debugClusterLod;
         m_clusterLodSystem.Update(GetDevice(), commandList, lodParams);
     }
@@ -1663,8 +1696,11 @@ void RTXMGRenderer::UpdateAccelerationStructures(const TessellatorConfig &tessCo
         subdInstance._meshPad = 0;
         subdInstance.vertexSurfaceDescriptorBindlessIndex = getDescriptorHeapIndex(mesh->m_vertexSurfaceDescriptorDescriptor);
         subdInstance.vertexControlPointIndicesBindlessIndex = getDescriptorHeapIndex(mesh->m_vertexControlPointIndicesDescriptor);
-        subdInstance.positionsBindlessIndex = getDescriptorHeapIndex(mesh->m_positionsDescriptor);
-        subdInstance.positionsPrevBindlessIndex = getDescriptorHeapIndex(mesh->m_positionsPrevDescriptor);
+        const SubdivisionSurface::Pose* pose = m_scene->GetSubdPose(instance);
+        subdInstance.positionsBindlessIndex =
+            getDescriptorHeapIndex(pose ? pose->positionsDescriptor : mesh->m_positionsDescriptor);
+        subdInstance.positionsPrevBindlessIndex =
+            pose ? getDescriptorHeapIndex(pose->positionsPrevDescriptor) : kInvalidBindlessIndex;
         subdInstance.surfaceToMaterialIndexBindlessIndex = getDescriptorHeapIndex(mesh->m_surfaceToMaterialIndexDescriptor);
         subdInstance.topologyQualityBindlessIndex = getDescriptorHeapIndex(mesh->m_topologyQualityDescriptor);
 

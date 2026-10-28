@@ -14,10 +14,19 @@
 #ifndef LERP_KEYFRAMES_PARAMS_H // using instead of "#pragma once" due to https://github.com/microsoft/DirectXShaderCompiler/issues/3943
 #define LERP_KEYFRAMES_PARAMS_H
 
-struct LerpKeyFramesParams
+struct LerpKeyFramesConstants
 {
     uint32_t numVertices;
-    float animTime;
+    uint32_t poseStride;  // elements between consecutive pose slices
+};
+
+// One per pose of the mesh; keyframe indices into the packed keyframe buffer.
+struct LerpKeyFramesPose
+{
+    uint32_t f0;
+    uint32_t f1;
+    float    blend;
+    uint32_t _pad;
 };
 
 #endif // LERP_KEYFRAMES_PARAMS_H

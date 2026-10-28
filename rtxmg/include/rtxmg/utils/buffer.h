@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <rtxmg/utils/vectorlog.h>
+#include <rtxmg/utils/vram_bytes.h>
 
 nvrhi::BufferDesc GetGenericDesc(size_t nElements, uint32_t elementSize, const char* name, nvrhi::Format format = nvrhi::Format::UNKNOWN);
 nvrhi::BufferDesc GetReadbackDesc(const nvrhi::BufferDesc& desc);
@@ -90,6 +91,7 @@ public:
     size_t GetElementBytes() const { return sizeof(T); }
     uint32_t GetNumElements() const { return m_buffer ? uint32_t(m_buffer->getDesc().byteSize / sizeof(T)) : 0; }
     size_t GetBytes() const { return m_buffer ? m_buffer->getDesc().byteSize : 0u; }
+    size_t GetVramBytes() const { return size_t(rtxmg::BufferVramBytes(m_buffer.Get())); }
     nvrhi::GpuVirtualAddress GetGpuVirtualAddress() const { return m_buffer->getGpuVirtualAddress(); }
     void Release() { m_buffer = nullptr; }
 

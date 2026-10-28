@@ -29,6 +29,7 @@
 #include "rtxmg/cluster_lod/shaderio.h"
 #include "rtxmg/cluster_lod/shaders/cluster_lod_material_resolve.hlsli"
 #include <nvrhi/nvrhiHLSL.h>
+#include "rtxmg/utils/wave_size.hlsli"
 
 // Same streaming binding set as stream_update_scene.hlsl — see that file
 // for the full slot map. Only the fields this shader touches are declared
@@ -39,6 +40,7 @@ RWStructuredBuffer<shaderio::SceneStreaming>                  streamingRW       
 // bit-field-struct stores left raw material bytes in the buffer.
 RWStructuredBuffer<uint>                                      u_NewClasGeometryIndices : register(u13);
 
+RTXMG_WAVE_SIZE_32
 [numthreads(shaderio::kStreamUpdateClasGeometryIndicesThreads, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint gti : SV_GroupIndex)
 {

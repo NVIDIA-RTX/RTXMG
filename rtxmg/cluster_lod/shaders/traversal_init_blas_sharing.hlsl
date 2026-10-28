@@ -42,7 +42,9 @@
 #include "rtxmg/cluster_lod/shaderio.h"
 #include "feature_gates.hlsli"
 #include "rtxmg/cluster_lod/shaders/traversal_common.hlsli"
+#include "rtxmg/utils/wave_size.hlsli"
 
+RTXMG_WAVE_SIZE_32
 [numthreads(shaderio::kTraversalInitThreads, 1, 1)]
 void main(uint3 gid : SV_DispatchThreadID)
 {

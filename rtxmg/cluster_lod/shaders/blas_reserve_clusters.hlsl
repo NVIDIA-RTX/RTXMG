@@ -75,7 +75,7 @@ void main(uint3 gid : SV_DispatchThreadID)
             // and seed the indirect-args slot with this BLAS's slice of the
             // shared CLAS-address pool.
             u_BlasArgs[buildOffset].clusterCount     = 0;
-            u_BlasArgs[buildOffset].reserved         = 0;
+            u_BlasArgs[buildOffset].clusterAddressStride = 8;
             u_BlasArgs[buildOffset].clusterAddresses =
                 g_Params.blasClasAddressesBaseVA +
                 uint64_t(referencesOffset) * uint64_t(8);

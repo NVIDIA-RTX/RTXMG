@@ -18,34 +18,99 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <numeric>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 using namespace donut::log;
 
+ClusterLodMetadataArena ClusterLodMetadataArena::Create(
+    const std::vector<const GeometryView*>& geometries,
+    nvrhi::IDevice*                         device)
+{
+    ClusterLodMetadataArena arena;
+    arena.slices.resize(geometries.size());
+
+    // D3D12 structured views start on a whole element; Vulkan descriptor offsets
+    // must also meet minStorageBufferOffsetAlignment, which the spec caps at 256.
+    const uint64_t viewAlignment =
+        device->getGraphicsAPI() == nvrhi::GraphicsAPI::VULKAN ? 256u : 1u;
+
+    uint64_t lodLevelsCursor = 0, lodNodesCursor = 0, lodNodeBboxesCursor = 0, groupAddressesCursor = 0;
+    auto place = [viewAlignment](uint64_t& cursor, auto& slice, size_t count)
+    {
+        constexpr uint64_t stride = sizeof(typename std::remove_reference_t<decltype(slice)>::ElementType);
+        const uint64_t alignment = std::lcm(stride, viewAlignment) / stride;
+        cursor = (cursor + alignment - 1) / alignment * alignment;
+        assert(cursor <= UINT32_MAX);
+        slice.firstElement = uint32_t(cursor);
+        // One-element floor, so an empty table still gets a valid view.
+        slice.numElements = uint32_t(std::max<size_t>(count, 1));
+        cursor += slice.numElements;
+    };
+
+    for (size_t i = 0; i < geometries.size(); ++i)
+    {
+        const GeometryView* geom = geometries[i];
+        if (!geom)
+            continue;
+        Slices& s = arena.slices[i];
+        place(lodLevelsCursor, s.lodLevels,
+              std::max<size_t>(geom->lodLevelsCount, geom->lodLevels.size()));
+        place(lodNodesCursor, s.lodNodes, geom->lodNodes.size());
+        place(lodNodeBboxesCursor, s.lodNodeBboxes,
+              std::max(geom->lodNodes.size(), geom->lodNodeBboxes.size()));
+        place(groupAddressesCursor, s.groupAddresses, geom->groupInfos.size());
+    }
+
+    arena.lodLevels.Create(lodLevelsCursor, "ClusterLodLodLevels", device);
+    arena.lodNodes.Create(lodNodesCursor, "ClusterLodLodNodes", device);
+    arena.lodNodeBboxes.Create(lodNodeBboxesCursor, "ClusterLodLodNodeBboxes", device);
+    arena.groupAddresses.Create(groupAddressesCursor, "ClusterLodStreamingGroupAddresses", device);
+
+    for (size_t i = 0; i < geometries.size(); ++i)
+    {
+        if (!geometries[i])
+            continue;
+        Slices& s = arena.slices[i];
+        s.lodLevels.buffer      = arena.lodLevels.GetBuffer();
+        s.lodNodes.buffer       = arena.lodNodes.GetBuffer();
+        s.lodNodeBboxes.buffer  = arena.lodNodeBboxes.GetBuffer();
+        s.groupAddresses.buffer = arena.groupAddresses.GetBuffer();
+    }
+    return arena;
+}
+
 ClusterLodPrebuiltGeometryMetadata ClusterLodPrebuiltGeometryMetadata::Build(
     const GeometryView&                     geom,
+    const ClusterLodMetadataArena&          arena,
+    size_t                                  arenaIndex,
     donut::engine::DescriptorTableManager*  descriptorTable,
-    nvrhi::IDevice*                         device,
     nvrhi::ICommandList*                    commandList)
 {
     ClusterLodPrebuiltGeometryMetadata out;
     BaseGeometry&                base = out.base;
 
-    // ---- LOD tree buffers ------------------------------------------------
+    const ClusterLodMetadataArena::Slices& slices = arena.slices[arenaIndex];
+    assert(slices.lodLevels.buffer);
+    base.lodLevels               = slices.lodLevels;
+    base.lodNodes                = slices.lodNodes;
+    base.lodNodeBboxes           = slices.lodNodeBboxes;
+    base.streamingGroupAddresses = slices.groupAddresses;
+
+    auto upload = [commandList](const auto& slice, const void* data, size_t bytes)
     {
-        const size_t numNodes     = geom.lodNodes.size();
-        const size_t numLodLevels = geom.lodLevelsCount;
+        assert(bytes <= slice.ByteSize());
+        if (bytes > 0)
+            commandList->writeBuffer(slice.buffer, data, bytes, slice.ByteOffset());
+    };
 
-        base.lodLevels.Create(numLodLevels, "ClusterLodLodLevels", device);
-        base.lodNodes.Create(numNodes,       "ClusterLodLodNodes",  device);
-        base.lodNodeBboxes.Create(numNodes,  "ClusterLodLodNodeBboxes", device);
-
-        commandList->writeBuffer(base.lodLevels,     geom.lodLevels.data(),     geom.lodLevels.size_bytes());
-        commandList->writeBuffer(base.lodNodes,      geom.lodNodes.data(),      geom.lodNodes.size_bytes());
-        commandList->writeBuffer(base.lodNodeBboxes, geom.lodNodeBboxes.data(), geom.lodNodeBboxes.size_bytes());
-    }
+    // ---- LOD tree buffers ------------------------------------------------
+    upload(base.lodLevels,     geom.lodLevels.data(),     geom.lodLevels.size_bytes());
+    upload(base.lodNodes,      geom.lodNodes.data(),      geom.lodNodes.size_bytes());
+    upload(base.lodNodeBboxes, geom.lodNodeBboxes.data(), geom.lodNodeBboxes.size_bytes());
 
     // Measure LOD node tree depth (root at index 0, leaves are isGroup=1).
     // The multipass traversal runs one traversal_run dispatch per depth.
@@ -76,36 +141,35 @@ ClusterLodPrebuiltGeometryMetadata ClusterLodPrebuiltGeometryMetadata::Build(
     {
         const size_t numGroups = geom.groupInfos.size();
 
-        base.streamingGroupAddresses.Create(std::max(numGroups, size_t(1)),
-                                            "ClusterLodStreamingGroupAddresses", device);
-
         // Every group starts non-resident (invalid blob SRV); derived classes
         // patch real addresses as groups stream in (preload fills all at Init).
         std::vector<shaderio::GroupAddress> groupAddresses(
             numGroups, shaderio::GroupAddress{ shaderio::kStreamingInvalidSrvIndex, 0u });
 
-        if (numGroups > 0)
-            commandList->writeBuffer(base.streamingGroupAddresses, groupAddresses.data(),
-                                     numGroups * sizeof(shaderio::GroupAddress));
+        upload(base.streamingGroupAddresses, groupAddresses.data(),
+               numGroups * sizeof(shaderio::GroupAddress));
 
         // Culling reads the node-level lodNodeBboxes; flattening a per-cluster
         // bbox table on top of that cost seconds of scene load at city scale.
     }
 
     // ---- Bindless registrations ---------------------------------------------
+    // Each view covers only this geometry's slice, so shaders index from 0.
     {
-        auto registerSRV = [&](nvrhi::IBuffer* buf,
+        auto registerSRV = [&](const auto& slice,
                                donut::engine::DescriptorHandle& outHandle) -> uint32_t
         {
             outHandle = descriptorTable->CreateDescriptorHandle(
-                nvrhi::BindingSetItem::StructuredBuffer_SRV(0, buf));
+                nvrhi::BindingSetItem::StructuredBuffer_SRV(0, slice.buffer, nvrhi::Format::UNKNOWN,
+                                                            slice.Range()));
             return static_cast<uint32_t>(outHandle.GetIndexInHeap());
         };
-        auto registerUAV = [&](nvrhi::IBuffer* buf,
+        auto registerUAV = [&](const auto& slice,
                                donut::engine::DescriptorHandle& outHandle) -> uint32_t
         {
             outHandle = descriptorTable->CreateDescriptorHandle(
-                nvrhi::BindingSetItem::StructuredBuffer_UAV(0, buf));
+                nvrhi::BindingSetItem::StructuredBuffer_UAV(0, slice.buffer, nvrhi::Format::UNKNOWN,
+                                                            slice.Range()));
             return static_cast<uint32_t>(outHandle.GetIndexInHeap());
         };
 
@@ -127,47 +191,28 @@ void ClusterLodResourcesBase::UploadGeometryMetadata(
     BaseGeometry&                           outBase,
     shaderio::Geometry&                     outShaderGeom,
     uint32_t                                instancesOffset,
-    uint32_t                                instancesCount,
-    donut::engine::DescriptorTableManager*  descriptorTable,
-    nvrhi::IDevice*                         device,
-    nvrhi::ICommandList*                    commandList)
+    uint32_t                                instancesCount)
 {
-    // Reuse scene-side metadata built on the load thread rather than rebuilding
-    // it on the render thread; placeholder entries fall through to Build().
-    const ClusterLodPrebuiltGeometryMetadata* pre =
-        (m_prebuiltMetadata && geomIndex < m_prebuiltMetadata->size() &&
-         (*m_prebuiltMetadata)[geomIndex].IsValid())
-            ? &(*m_prebuiltMetadata)[geomIndex]
-            : nullptr;
+    if (!m_prebuiltMetadata || geomIndex >= m_prebuiltMetadata->size() ||
+        !(*m_prebuiltMetadata)[geomIndex].IsValid())
+    {
+        fatal("ClusterLod: geometry %zu has no pre-built metadata; the scene builds it at load.",
+              geomIndex);
+        return;
+    }
+    const ClusterLodPrebuiltGeometryMetadata& pre = (*m_prebuiltMetadata)[geomIndex];
 
-    uint32_t lodLevelsSRV, nodesSRV, nodeBboxesSRV, groupAddressesSRV, groupAddressesUAV;
-    uint32_t nodeTreeDepth;
-    if (pre)
-    {
-        outBase.lodLevels               = pre->base.lodLevels;
-        outBase.lodNodes                = pre->base.lodNodes;
-        outBase.lodNodeBboxes           = pre->base.lodNodeBboxes;
-        outBase.streamingGroupAddresses = pre->base.streamingGroupAddresses;
-        // Descriptor handles stay scene-owned; outBase's handles remain empty.
-        lodLevelsSRV      = pre->lodLevelsSRV;
-        nodesSRV          = pre->nodesSRV;
-        nodeBboxesSRV     = pre->nodeBboxesSRV;
-        groupAddressesSRV = pre->groupAddressesSRV;
-        groupAddressesUAV = pre->groupAddressesUAV;
-        nodeTreeDepth     = pre->nodeTreeDepth;
-    }
-    else
-    {
-        ClusterLodPrebuiltGeometryMetadata built =
-            ClusterLodPrebuiltGeometryMetadata::Build(geom, descriptorTable, device, commandList);
-        lodLevelsSRV      = built.lodLevelsSRV;
-        nodesSRV          = built.nodesSRV;
-        nodeBboxesSRV     = built.nodeBboxesSRV;
-        groupAddressesSRV = built.groupAddressesSRV;
-        groupAddressesUAV = built.groupAddressesUAV;
-        nodeTreeDepth     = built.nodeTreeDepth;
-        outBase           = std::move(built.base);  // handles owned by outBase
-    }
+    outBase.lodLevels               = pre.base.lodLevels;
+    outBase.lodNodes                = pre.base.lodNodes;
+    outBase.lodNodeBboxes           = pre.base.lodNodeBboxes;
+    outBase.streamingGroupAddresses = pre.base.streamingGroupAddresses;
+    // Descriptor handles stay scene-owned; outBase's handles remain empty.
+    const uint32_t lodLevelsSRV      = pre.lodLevelsSRV;
+    const uint32_t nodesSRV          = pre.nodesSRV;
+    const uint32_t nodeBboxesSRV     = pre.nodeBboxesSRV;
+    const uint32_t groupAddressesSRV = pre.groupAddressesSRV;
+    const uint32_t groupAddressesUAV = pre.groupAddressesUAV;
+    const uint32_t nodeTreeDepth     = pre.nodeTreeDepth;
 
     m_maxNodeTreeDepth = std::max(m_maxNodeTreeDepth, nodeTreeDepth);
 

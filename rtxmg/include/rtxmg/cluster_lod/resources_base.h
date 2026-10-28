@@ -45,6 +45,48 @@ inline uint32_t ResolveClasPositionTruncateBits(uint32_t knobBits, const BakerCo
                     bakerConfig.useCompressedData ? bakerConfig.compressionPosDropBits : 0u);
 }
 
+// A geometry's element range inside a buffer shared by many geometries.
+template <typename T>
+struct GeometryMetadataSlice
+{
+    using ElementType = T;
+
+    nvrhi::BufferHandle buffer;
+    uint32_t            firstElement = 0;
+    uint32_t            numElements  = 0;
+
+    uint64_t           ByteOffset() const { return uint64_t(firstElement) * sizeof(T); }
+    uint64_t           ByteSize() const { return uint64_t(numElements) * sizeof(T); }
+    nvrhi::BufferRange Range() const { return nvrhi::BufferRange(ByteOffset(), ByteSize()); }
+};
+
+// ---------------------------------------------------------------------------
+// ClusterLodMetadataArena — one shared buffer per metadata kind for a batch of
+// geometries, each geometry owning an aligned slice, so a city-scale scene needs
+// a handful of buffers instead of thousands.  The slices' buffer handles keep the
+// buffers alive, so the arena itself is only needed while the batch is being built.
+// ---------------------------------------------------------------------------
+struct ClusterLodMetadataArena
+{
+    RTXMGBuffer<shaderio::LodLevel>     lodLevels;
+    RTXMGBuffer<shaderio::Node>         lodNodes;
+    RTXMGBuffer<shaderio::BBox>         lodNodeBboxes;
+    RTXMGBuffer<shaderio::GroupAddress> groupAddresses;
+
+    struct Slices
+    {
+        GeometryMetadataSlice<shaderio::LodLevel>     lodLevels;
+        GeometryMetadataSlice<shaderio::Node>         lodNodes;
+        GeometryMetadataSlice<shaderio::BBox>         lodNodeBboxes;
+        GeometryMetadataSlice<shaderio::GroupAddress> groupAddresses;
+    };
+    std::vector<Slices> slices;  // parallel to Create's input; empty for null entries
+
+    // Null entries get no slice, so a batch can skip already-built geometries.
+    static ClusterLodMetadataArena Create(const std::vector<const GeometryView*>& geometries,
+                                          nvrhi::IDevice*                        device);
+};
+
 // ---------------------------------------------------------------------------
 // BaseGeometry — per-geometry resources both preloaded and streaming need.
 // The per-cluster CLAS-address / cluster-address tables are NOT here: they are
@@ -53,12 +95,12 @@ inline uint32_t ResolveClasPositionTruncateBits(uint32_t knobBits, const BakerCo
 struct BaseGeometry
 {
     // LoD hierarchy (one entry per LoD level / node).
-    RTXMGBuffer<shaderio::LodLevel>           lodLevels;
-    RTXMGBuffer<shaderio::Node>               lodNodes;
-    RTXMGBuffer<shaderio::BBox>               lodNodeBboxes;
+    GeometryMetadataSlice<shaderio::LodLevel>     lodLevels;
+    GeometryMetadataSlice<shaderio::Node>         lodNodes;
+    GeometryMetadataSlice<shaderio::BBox>         lodNodeBboxes;
 
     // Per-group blob address table.
-    RTXMGBuffer<shaderio::GroupAddress>       streamingGroupAddresses;
+    GeometryMetadataSlice<shaderio::GroupAddress> streamingGroupAddresses;
 
     // Descriptor handles — keep ResourceDescriptorHeap registrations alive
     // for the lifetime of this geometry.  Heap indices stored in the
@@ -74,7 +116,7 @@ struct BaseGeometry
 
 // ---------------------------------------------------------------------------
 // ClusterLodPrebuiltGeometryMetadata — the expensive half of UploadGeometryMetadata
-// (buffer creation + upload + bindless registration + node-tree depth scan),
+// (arena upload + bindless registration + node-tree depth scan),
 // pre-built per geometry on the async scene-load thread with loading-screen
 // progress instead of stalling the render thread inside streaming/preload init
 // (~8 s for a scene with a couple of thousand geometries).  The scene owns the
@@ -95,18 +137,19 @@ struct ClusterLodPrebuiltGeometryMetadata
     // LoD node tree depth (traversal pass sizing).
     uint32_t nodeTreeDepth = 1;
 
-    // False for a default-constructed placeholder (index-aligned slot whose
-    // geometry hasn't been built yet — the pump fills those in).
-    bool IsValid() const { return base.lodLevels.GetBuffer() != nullptr; }
+    // False for a default-constructed entry whose geometry hasn't been built yet.
+    bool IsValid() const { return base.lodLevels.buffer != nullptr; }
 
-    // Create + upload + register everything for one geometry.  Safe to call
-    // from the scene-load thread concurrently with render-thread texture
-    // finalize (DescriptorTableManager locks internally; nvrhi resource
-    // creation and per-thread command-list recording are free-threaded).
+    // Upload + register everything for one geometry into its slice
+    // (arena.slices[arenaIndex]).  Safe to call from the scene-load thread
+    // concurrently with render-thread texture finalize and with other geometries
+    // of the same arena (DescriptorTableManager locks internally; per-thread
+    // command-list recording is free-threaded and slices are disjoint).
     static ClusterLodPrebuiltGeometryMetadata Build(
         const GeometryView&                     geom,
+        const ClusterLodMetadataArena&          arena,
+        size_t                                  arenaIndex,
         donut::engine::DescriptorTableManager*  descriptorTable,
-        nvrhi::IDevice*                         device,
         nvrhi::ICommandList*                    commandList);
 };
 
@@ -184,10 +227,9 @@ public:
     }
     bool GetEnableMaterials() const { return m_enableMaterials; }
 
-    // Optional scene-owned pre-uploaded per-geometry metadata (one entry per
-    // geometry, same order as the geometry array).  Must be set BEFORE Init
-    // and outlive this object; UploadGeometryMetadata then reuses the
-    // buffers/registrations instead of creating them on the render thread.
+    // Scene-owned pre-uploaded per-geometry metadata (one entry per geometry,
+    // same order as the geometry array).  Must be set BEFORE Init and outlive
+    // this object; UploadGeometryMetadata adopts its buffers and registrations.
     void SetPrebuiltGeometryMetadata(const std::vector<ClusterLodPrebuiltGeometryMetadata>* prebuilt)
     {
         m_prebuiltMetadata = prebuilt;
@@ -204,9 +246,8 @@ public:
 
 protected:
     // Shared per-geometry init, called from both derived classes' Init loops:
-    // uploads the LoD tree + flat-metadata buffers, registers their SRVs in the
-    // bindless heap, fills the base fields of `outShaderGeom`, and updates
-    // m_maxNodeTreeDepth.
+    // adopts the pre-built LoD tree buffers and bindless SRVs, fills the base
+    // fields of `outShaderGeom`, and updates m_maxNodeTreeDepth.
     //
     // Does NOT touch:
     //   - groupData / clasData (preload-only, in PreloadGeometry)
@@ -221,10 +262,7 @@ protected:
         BaseGeometry&                           outBase,
         shaderio::Geometry&                     outShaderGeom,
         uint32_t                                instancesOffset,
-        uint32_t                                instancesCount,
-        donut::engine::DescriptorTableManager*  descriptorTable,
-        nvrhi::IDevice*                         device,
-        nvrhi::ICommandList*                    commandList);
+        uint32_t                                instancesCount);
 
     // Protected so the derived classes can read and patch them in place.
     std::vector<shaderio::Geometry>          m_shaderGeometries;
@@ -263,9 +301,8 @@ protected:
     // kernel) still reports a sane value.
     uint32_t m_maxClustersPerGroup = 32;
 
-    // Scene-owned pre-uploaded metadata (see SetPrebuiltGeometryMetadata);
-    // null when the scene didn't pre-build (UploadGeometryMetadata creates
-    // everything on demand).
+    // Scene-owned pre-uploaded metadata (see SetPrebuiltGeometryMetadata),
+    // required: every geometry's entry is built during scene load.
     const std::vector<ClusterLodPrebuiltGeometryMetadata>* m_prebuiltMetadata = nullptr;
 
     // Scene-global cluster-LoD material base, copied by Init() into every

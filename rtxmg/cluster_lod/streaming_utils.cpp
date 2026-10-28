@@ -128,7 +128,7 @@ void StreamingRequests::Deinit()
 
 size_t StreamingRequests::GetOperationsSize() const
 {
-    return m_requestBuffer.GetBytes();
+    return m_requestBuffer.GetVramBytes();
 }
 
 void StreamingRequests::ApplyTask(shaderio::StreamingFrameRequest& shaderData,
@@ -257,12 +257,11 @@ void StreamingResident::Deinit()
 
 size_t StreamingResident::GetOperationsSize() const
 {
-    return m_groupsBuffer.GetBytes()
-         + m_groupIDsBuffer.GetBytes()
-         + m_clustersBuffer.GetBytes()
-         + m_activeGroupsBuffer.GetBytes()
-         + m_activeUpdateBuffer.GetBytes()
-         + m_activeHostBuffer.GetBytes();
+    return m_groupsBuffer.GetVramBytes()
+         + m_groupIDsBuffer.GetVramBytes()
+         + m_clustersBuffer.GetVramBytes()
+         + m_activeGroupsBuffer.GetVramBytes()
+         + m_activeUpdateBuffer.GetVramBytes();
 }
 
 void StreamingResident::InitClas(nvrhi::IDevice*              device,
@@ -309,10 +308,10 @@ size_t StreamingResident::GetClasOperationsSize() const
 {
     // Management metadata only — m_clasDataBuffer is the payload pool, not
     // "operations" bytes.
-    return m_clasAddressesBuffer.GetBytes()
-         + m_clasSizesBuffer.GetBytes()
-         + m_groupClasSizesBuffer.GetBytes()
-         + m_residentPersistentBuffer.GetBytes();
+    return m_clasAddressesBuffer.GetVramBytes()
+         + m_clasSizesBuffer.GetVramBytes()
+         + m_groupClasSizesBuffer.GetVramBytes()
+         + m_residentPersistentBuffer.GetVramBytes();
 }
 
 StreamingResident::ResidencyStats StreamingResident::GetStats() const
@@ -775,7 +774,7 @@ void StreamingAllocator::Deinit()
 
 size_t StreamingAllocator::GetOperationsSize() const
 {
-    return m_managementBuffer.GetBytes();
+    return m_managementBuffer.GetVramBytes();
 }
 
 uint32_t StreamingAllocator::GetMaxSized() const
@@ -924,7 +923,7 @@ void StreamingUpdates::Init(nvrhi::IDevice*        device,
 
 size_t StreamingUpdates::GetOperationsSize() const
 {
-    return m_patchesBuffer.GetBytes();
+    return m_patchesBuffer.GetVramBytes() + m_geometryPatchesBuffer.GetVramBytes();
 }
 
 void StreamingUpdates::InitClas(nvrhi::IDevice*        device,
@@ -958,7 +957,7 @@ void StreamingUpdates::InitClas(nvrhi::IDevice*        device,
 
     makeStructuredBuffer(m_newClasBuildsBuffer,          maxLoadClusters, sizeof(shaderio::ClasBuildInfo), "rtxmg::StreamingUpdates::newClasBuilds");
     makeStructuredBuffer(m_newClasAddressesBuffer,       maxLoadClusters, sizeof(uint64_t),                 "rtxmg::StreamingUpdates::newClasAddresses");
-    makeStructuredBuffer(m_newClasSizesBuffer,           maxLoadClusters, sizeof(uint32_t),                 "rtxmg::StreamingUpdates::newClasSizes");
+    makeStructuredBuffer(m_newClasSizesBuffer,           maxLoadClusters, GetClusterOperationSizeBytes(device), "rtxmg::StreamingUpdates::newClasSizes");
     makeStructuredBuffer(m_newClasResidentIDsBuffer,     maxLoadClusters, sizeof(uint32_t),                 "rtxmg::StreamingUpdates::newClasResidentIDs");
 
     // The mixed-cluster geometry-indices buffer is written as a UAV by
@@ -1001,13 +1000,13 @@ void StreamingUpdates::InitClas(nvrhi::IDevice*        device,
 
 size_t StreamingUpdates::GetClasOperationsSize() const
 {
-    return m_newClasBuildsBuffer.GetBytes()
-         + m_newClasAddressesBuffer.GetBytes()
-         + m_newClasSizesBuffer.GetBytes()
-         + m_newClasResidentIDsBuffer.GetBytes()
-         + m_newClasGeometryIndicesBuffer.GetBytes()
-         + m_moveClasDstAddressesBuffer.GetBytes()
-         + m_moveClasSrcAddressesBuffer.GetBytes();
+    return m_newClasBuildsBuffer.GetVramBytes()
+         + m_newClasAddressesBuffer.GetVramBytes()
+         + m_newClasSizesBuffer.GetVramBytes()
+         + m_newClasResidentIDsBuffer.GetVramBytes()
+         + m_newClasGeometryIndicesBuffer.GetVramBytes()
+         + m_moveClasDstAddressesBuffer.GetVramBytes()
+         + m_moveClasSrcAddressesBuffer.GetVramBytes();
 }
 
 uint32_t StreamingUpdates::GetMaxCachedBlasBuilds() const

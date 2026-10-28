@@ -38,12 +38,15 @@ struct StreamingStats
     // Every table the streaming engine allocates that is neither the geometry
     // pool nor the CLAS pool: resident slot tables (sized by maxGroups), the
     // request/patch rings and per-frame CLAS-build arrays (maxPerFrameLoad-
-    // Requests), and the persistent allocator's management buffers.
+    // Requests), and the persistent allocator's management buffers.  VRAM
+    // occupied (rtxmg::BufferVramBytes), so the CPU-mapped rings are excluded.
     uint64_t operationsBytes = 0;
 
     uint32_t persistentGroups    = 0;
     uint32_t persistentClusters  = 0;
     uint32_t persistentTriangles = 0;
+    // VRAM occupied by each geometry's LOD hierarchy + pinned low-detail data,
+    // and by the pinned low-detail CLAS.
     uint64_t persistentDataBytes = 0;
     uint64_t persistentClasBytes = 0;
 

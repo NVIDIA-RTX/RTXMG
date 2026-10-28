@@ -45,6 +45,7 @@ static void printUsageAndExit(const char* argv0,
         "  -d                      | --debug                 Enable D3D12 Debug Layer\n"
         "  -gd                     | --gpudebug              Enable D3D12 GPU Validation + NVAPI ray tracing validation\n"
         "                          | --sllog                 Enable verbose Streamline (DLSS/denoiser) logging\n"
+        "                          | --cluster-api <api>     D3D12 cluster operations: auto (default; DXR clusters when supported, else NVAPI) | dxr | nvapi\n"
         "  -v                      | --verbose               Log per-geometry / per-LoD / per-texture detail (~99% of the output on a large scene)\n"
         "  -ds <float>             | --displacementScale     Displacement scale along normal (relative to the largest extent of the object's AABB)\n"
         "  -ed                     | --enableDenoiser        Enable Denoiser\n"
@@ -55,6 +56,7 @@ static void printUsageAndExit(const char* argv0,
         "  -dp <x> <y>             | --debugPixel            Set shader-debug predicate pixel (display coords; auto-scaled to render-target); also triggers debug-buffer readback on the last frame of -nf\n"
         "                          | --dlssMode <m>          DLSS quality mode: off | ultra | performance | balanced | quality | DLAA (1:1 render-to-display so -dp pixel coords match the screenshot exactly)\n"
         "  -ftr <f>                | --fineTessellationRate  Fine adaptive edge sampling rate\n"
+        "                          | --adaptive-tess-rate    Cluster tess: scale the fine/coarse tessellation rates down on the GPU under tessellation-budget pressure (>85%% of max clusters/CLAS/vertex memory: one step down to 75%%, <60%%: slow recovery; never finer than -ftr/-ctr). ON BY DEFAULT; disable with --no-adaptive-tess-rate. Runtime-togglable in the UI\n"
         "                          | --auto-exposure         Auto-exposure: donut histogram eye-adaptation drives exposure from average scene luminance; the Exposure slider becomes an exposure-compensation multiplier. ON BY DEFAULT; disable with --no-auto-exposure. Runtime-togglable in the UI\n"
         "  -lpe <f>                | --lodPixelError         Cluster-LoD target screen-space error in pixels (default 1.0)\n"
         "                          | --adaptive-error        Cluster-LoD: raise the effective lodPixelError under streaming-budget pressure (>85%% load: +2%%/frame, <70%%: slow recovery; never below -lpe). ON BY DEFAULT; disable with --no-adaptive-error. Runtime-togglable in the UI\n"
@@ -136,6 +138,8 @@ static void printUsageAndExit(const char* argv0,
         "                          | --lpe-sweep [frames]    Cycle lodPixelError through 1,2,4,8,16,32,16,8,4,2,1 every N frames (default 5; loops)\n"
         "                          | --dolly                 Smooth linear dolly oscillating 1 s forward then 1 s back (loops) at the camera fly speed; reproduces spatial-LoD streaming load/evict transitions\n"
         "                          | --dolly-frames <n>      Like --dolly, but advances a fixed 1/n of a leg per frame instead of by wall-clock time, so the camera path is reproducible and can back a baseline\n"
+        "                          | --anim-step <k>         Play subd animation at a fixed k keyframes per rendered frame instead of by wall-clock time, so a run is reproducible\n"
+        "                          | --anim-dump <dir>       Each frame, write the render-res albedo (alb_NNNN.npy) and motion vectors (mv_NNNN.npy) to <dir>. Stalls the GPU every frame\n"
         "                          | --blas-toggle-sweep [frames]  Cycle the BLAS sharing/caching toggles every N frames (default 10; loops) once streaming has settled, as if clicking the UI checkboxes\n"
         "                          | --blas-toggle-settle <frames> Frames to let the scene settle after load before --blas-toggle-sweep starts toggling (default 60)\n"
         "                          | --blas-toggle-mode <mode>  Which checkbox --blas-toggle-sweep drives: 'both' (default; mirrors the UI, unchecking sharing clears caching), 'sharing' or 'caching' (holds the other fixed to isolate one edge)\n"
@@ -247,6 +251,14 @@ void Args::Parse(int argc, char const* const* argv)
         else if (arg == "--sllog")
         {
             enableStreamlineLog = true;
+        }
+        else if (arg == "--cluster-api")
+        {
+            static const std::map<std::string, ClusterApiRequest> clusterApis{
+                {"auto", ClusterApiRequest::Auto},
+                {"dxr", ClusterApiRequest::Dxr},
+                {"nvapi", ClusterApiRequest::Nvapi} };
+            parseArgValues(1, [&]() { clusterApi = parseEnum(argv[++i], clusterApis); });
         }
         else if (arg == "--help" || arg == "-h")
         {
@@ -440,6 +452,14 @@ void Args::Parse(int argc, char const* const* argv)
         {
             parseArgValues(1, [&]() { coarseTessellationRate = (float)atof(argv[++i]); });
         }
+        else if (arg == "--adaptive-tess-rate")
+        {
+            adaptiveTessRate = true;
+        }
+        else if (arg == "--no-adaptive-tess-rate")
+        {
+            adaptiveTessRate = false;
+        }
         else if (arg == "--lodPixelError" || arg == "-lpe")
         {
             parseArgValues(1, [&]() { lodPixelError = (float)atof(argv[++i]); });
@@ -479,7 +499,7 @@ void Args::Parse(int argc, char const* const* argv)
             // Optional CLAS-pool cap in MB (e.g. "--linearalloc 64"), to check
             // that compaction bounds usage to the peak resident working set.
             if (i + 1 < argc && argv[i + 1][0] != '-')
-                clasPoolOverrideMB = uint32_t(std::max(1, atoi(argv[++i])));
+                clodBudgets.clasPoolOverrideMB = uint32_t(std::max(1, atoi(argv[++i])));
         }
         else if (arg == "--nomat" || arg == "--no-materials")
         {
@@ -488,7 +508,7 @@ void Args::Parse(int argc, char const* const* argv)
 #endif
         else if (arg == "--maxframeloadrequests" || arg == "--max-frame-load-requests")
         {
-            parseArgValues(1, [&]() { maxFrameLoadRequests = uint32_t(std::max(1, atoi(argv[++i]))); });
+            parseArgValues(1, [&]() { clodBudgets.maxFrameLoadRequests = uint32_t(std::max(1, atoi(argv[++i]))); });
         }
         else if (arg == "--claspositionbits" || arg == "--clas-position-bits")
         {
@@ -497,21 +517,21 @@ void Args::Parse(int argc, char const* const* argv)
         }
         else if (arg == "--maxresidentgroups" || arg == "--max-resident-groups")
         {
-            parseArgValues(1, [&]() { maxResidentGroups = uint32_t(std::max(1, atoi(argv[++i]))); });
+            parseArgValues(1, [&]() { clodBudgets.maxResidentGroups = uint32_t(std::max(1, atoi(argv[++i]))); });
         }
         else if (arg == "--geometry-pool-mb" || arg == "--geometrypoolmb")
         {
-            parseArgValues(1, [&]() { maxGeometryMB = uint32_t(std::max(1, atoi(argv[++i]))); });
+            parseArgValues(1, [&]() { clodBudgets.maxGeometryMB = uint32_t(std::max(1, atoi(argv[++i]))); });
         }
         else if (arg == "--clas-pool-mb" || arg == "--claspoolmb")
         {
-            parseArgValues(1, [&]() { maxClasMB = uint32_t(std::max(1, atoi(argv[++i]))); });
+            parseArgValues(1, [&]() { clodBudgets.maxClasMB = uint32_t(std::max(1, atoi(argv[++i]))); });
         }
         else if (arg == "--render-cluster-bits" || arg == "--renderclusterbits")
         {
             // Per-frame render-cluster budget = 1<<bits.  Clamp [16,25] (matches
             // the UI slider + ClusterLodPass kMin/kMaxRenderClusterBits).
-            parseArgValues(1, [&]() { renderClusterBits = uint32_t(std::clamp(atoi(argv[++i]), 16, 25)); });
+            parseArgValues(1, [&]() { clodBudgets.renderClusterBits = uint32_t(std::clamp(atoi(argv[++i]), 16, 25)); });
         }
         else if (arg == "--blassharing" || arg == "--blas-sharing" || arg == "-bs")
         {
@@ -674,6 +694,14 @@ void Args::Parse(int argc, char const* const* argv)
         {
             dolly = true;
             parseArgValues(1, [&]() { dollyFrames = uint32_t(std::max(1, atoi(argv[++i]))); });
+        }
+        else if (arg == "--anim-step")
+        {
+            parseArgValues(1, [&]() { animStep = std::max(0.f, float(atof(argv[++i]))); });
+        }
+        else if (arg == "--anim-dump")
+        {
+            parseArgValues(1, [&]() { animDumpDir = argv[++i]; });
         }
         else if (arg == "--blas-toggle-sweep" || arg == "--blastogglesweep")
         {

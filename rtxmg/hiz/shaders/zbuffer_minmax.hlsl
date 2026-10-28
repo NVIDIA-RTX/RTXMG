@@ -10,9 +10,12 @@
  * its affiliates is strictly prohibited.
  */
 
+#include "rtxmg/utils/wave_size.hlsli"
+
 Texture2D<float> zbuffer: register(t0);
 RWStructuredBuffer<uint> minmax: register(u0); // floats-as-uints because depth values are non-negative.
 
+RTXMG_WAVE_SIZE_32
 [numthreads(16, 16, 1)]
 void main(uint2 threadIdx : SV_GroupThreadID, uint2 dispatchThreadId : SV_DispatchThreadID)
 {

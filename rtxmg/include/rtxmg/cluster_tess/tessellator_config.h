@@ -70,6 +70,7 @@ struct TessellatorConfig
 
     float fineTessellationRate = kDefaultFineTessellationRate;
     float coarseTessellationRate = kDefaultCoarseTessellationRate;
+    bool  enableAdaptiveTessRate = true; // scale the rates down under budget pressure
     bool  enableFrustumVisibility = true;
     bool  enableHiZVisibility = true;
     bool  enableBackfaceVisibility = true;

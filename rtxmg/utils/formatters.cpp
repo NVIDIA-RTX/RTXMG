@@ -13,9 +13,10 @@
 #include "rtxmg/utils/formatters.h"
 
 #include <assert.h>
+#include <cstdint>
 #include <cstdio>
 #include <cmath>
-#include <xutility>
+#include <iterator>
 
 int HumanFormatter(double value, char* buff, int bufsize, void*)
 {

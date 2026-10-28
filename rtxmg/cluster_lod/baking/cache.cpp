@@ -296,8 +296,8 @@ bool SaveCache(const std::filesystem::path&     path,
         return false;
 
     // Write to disk.
-    FILE* f = nullptr;
-    if (fopen_s(&f, path.string().c_str(), "wb") != 0 || !f)
+    FILE* f = fopen(path.string().c_str(), "wb");
+    if (!f)
     {
         log::error("SaveCache: cannot open '%s' for writing", path.string().c_str());
         return false;
@@ -364,8 +364,8 @@ bool SaveShardAtomic(const std::filesystem::path& path,
     tmp += ".tmp" + std::to_string(RTXMG_GETPID()) + "_" +
            std::to_string(s_tmpCounter.fetch_add(1, std::memory_order_relaxed));
 
-    FILE* f = nullptr;
-    if (fopen_s(&f, tmp.string().c_str(), "wb") != 0 || !f)
+    FILE* f = fopen(tmp.string().c_str(), "wb");
+    if (!f)
     {
         log::error("SaveShardAtomic: cannot open '%s' for writing", tmp.string().c_str());
         return false;

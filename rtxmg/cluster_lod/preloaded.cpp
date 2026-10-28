@@ -13,6 +13,7 @@
 #include "rtxmg/cluster_lod/preloaded.h"
 
 #include "rtxmg/cluster_lod/group_codec.h"  // DecompressGroup
+#include "rtxmg/utils/cluster_operation.h"
 
 #include <donut/core/log.h>
 #include <donut/core/math/math.h>
@@ -171,8 +172,7 @@ void ClusterLodPreloaded::Init(
         // LoD tree, base shaderio::Geometry fields and base SRVs — shared with
         // the streaming path.
         UploadGeometryMetadata(g, geom, preloadGeom, shaderGeom,
-                               instancesOffset, instanceCount[g],
-                               descriptorTable, device, commandList);
+                               instancesOffset, instanceCount[g]);
 
         // ---- Group-data buffer (cluster blobs) --------------------------------
         {
@@ -278,9 +278,10 @@ void ClusterLodPreloaded::Init(
             }
 
             if (!groupAddresses.empty())
-                commandList->writeBuffer(preloadGeom.streamingGroupAddresses,
+                commandList->writeBuffer(preloadGeom.streamingGroupAddresses.buffer,
                                          groupAddresses.data(),
-                                         groupAddresses.size() * sizeof(shaderio::GroupAddress));
+                                         groupAddresses.size() * sizeof(shaderio::GroupAddress),
+                                         preloadGeom.streamingGroupAddresses.ByteOffset());
         }
 
         // UploadGeometryMetadata leaves lowDetailClusterID as a per-geom local
@@ -386,9 +387,9 @@ void ClusterLodPreloaded::LogGeometryData() const
 
         info("  geom[%zu]: lodNodes count=%u lodLevels count=%u groupAddresses count=%u",
              g,
-             m_geometries[g].lodNodes.GetNumElements(),
-             m_geometries[g].lodLevels.GetNumElements(),
-             m_geometries[g].streamingGroupAddresses.GetNumElements());
+             m_geometries[g].lodNodes.numElements,
+             m_geometries[g].lodLevels.numElements,
+             m_geometries[g].streamingGroupAddresses.numElements);
     }
     info("  numRenderInstances=%zu", m_renderInstances.size());
     for (size_t i = 0; i < m_renderInstances.size(); ++i)
@@ -408,7 +409,7 @@ void ClusterLodPreloaded::InitClas(
     const size_t numGeom = geometries.size();
 
     // BLAS build args (one per geometry); filled incrementally below.
-    std::vector<cluster::IndirectArgs> blasArgs(numGeom, {});
+    std::vector<cluster::IndirectArgs> blasArgs(numGeom);
 
     for (size_t g = 0; g < numGeom; ++g)
     {
@@ -423,7 +424,7 @@ void ClusterLodPreloaded::InitClas(
         // CLAS addresses land in the scene-global m_residentClasAddresses at
         // [geomClusterBase, +numClusters); sizes are only needed transiently.
         const uint32_t geomClusterBase = m_geomFirstClusterResidentID[g];
-        RTXMGBuffer<uint32_t> tempSizes;
+        ClusterOperationSizesBuffer tempSizes;
         tempSizes.Create(numClusters, "ClusterLodPreloadClasSizesTemp", device);
 
         // -- Build IndirectTriangleClasArgs[] on CPU --------------------------
@@ -434,7 +435,7 @@ void ClusterLodPreloaded::InitClas(
         uint32_t totalTriangles         = 0;
         uint32_t totalVertices          = 0;
 
-        std::vector<cluster::IndirectTriangleClasArgs> clasArgs(numClusters);
+        std::vector<cluster::nv::IndirectTriangleClasArgs> clasArgs(numClusters);
 
         // Per-triangle geometryIndexAndFlags for every mixed cluster in this
         // geometry, concatenated; each cluster's arg points at its own slice,
@@ -493,7 +494,7 @@ void ClusterLodPreloaded::InitClas(
                         + sizeof(shaderio::Group)
                         + sizeof(shaderio::Cluster) * c;
 
-                    cluster::IndirectTriangleClasArgs& arg = clasArgs[clusterOffset + c];
+                    cluster::nv::IndirectTriangleClasArgs& arg = clasArgs[clusterOffset + c];
                     arg = {};
                     // Scene-global, so the hit shader's GetClusterID() indexes
                     // the global resident tables directly.
@@ -589,16 +590,11 @@ void ClusterLodPreloaded::InitClas(
         }
 
         // Upload CLAS build args.
-        RTXMGBuffer<cluster::IndirectTriangleClasArgs> clasArgsBuffer;
-        {
-            auto desc = GetGenericDesc(numClusters,
-                                       uint32_t(sizeof(cluster::IndirectTriangleClasArgs)),
-                                       "ClusterLodClasArgsBuffer")
-                            .setIsAccelStructBuildInput(true);
-            clasArgsBuffer.Create(desc, device);
-            commandList->writeBuffer(clasArgsBuffer, clasArgs.data(),
-                                     numClusters * sizeof(cluster::IndirectTriangleClasArgs));
-        }
+        nvrhi::BufferHandle clasArgsBuffer = CreateAndUploadClusterArgs(
+            clasArgs,
+            GetGenericDesc(numClusters, uint32_t(sizeof(cluster::nv::IndirectTriangleClasArgs)), "ClusterLodClasArgsBuffer")
+                .setIsAccelStructBuildInput(true),
+            commandList);
 
         // -- GetSizes pass: query per-CLAS sizes --------------------------------
         cluster::OperationParams clasParams = {};
@@ -620,6 +616,7 @@ void ClusterLodPreloaded::InitClas(
         clasParams.clas.maxTotalTriangleCount     = totalTriangles;
         clasParams.clas.maxTotalVertexCount       = totalVertices;
         clasParams.clas.minPositionTruncateBitCount = m_clasPositionTruncateBits;
+        clasParams.clas.indexFormat                 = cluster::OperationIndexFormat::IndexFormat8bit;
 
         cluster::OperationSizeInfo sizeInfo = device->getClusterOperationSizeInfo(clasParams);
 
@@ -635,7 +632,7 @@ void ClusterLodPreloaded::InitClas(
         }
 
         // Download sizes (closes + submits + reopens commandList).
-        const std::vector<uint32_t> clasSizes = tempSizes.Download(commandList);
+        const std::vector<uint64_t> clasSizes = tempSizes.Download(commandList);
 
         // -- Allocate clasData and compute per-cluster CLAS addresses ----------
         //    The build consumes addresses contiguously from offset 0, so it gets
@@ -645,7 +642,7 @@ void ClusterLodPreloaded::InitClas(
         tempAddrs.Create(numClusters, "ClusterLodPreloadClasAddrsTemp", device);
         {
             uint64_t totalClasSize = 0;
-            for (uint32_t size : clasSizes)
+            for (uint64_t size : clasSizes)
             {
                 assert(size && "CLAS with invalid size");
                 totalClasSize += size;
@@ -711,7 +708,7 @@ void ClusterLodPreloaded::InitClas(
                 lowDetailClusters = uint32_t(geom.groupInfos[lastLevel.groupOffset].clusterCount);
             }
             blasArgs[g].clusterCount    = lowDetailClusters;
-            blasArgs[g].reserved        = 0;
+            blasArgs[g].clusterAddressStride = 8;
             blasArgs[g].clusterAddresses =
                 (m_residentClasAddresses.GetBuffer() ? m_residentClasAddresses.GetGpuVirtualAddress() : 0ull)
                 + static_cast<uint64_t>(lowDetailClusterID) * sizeof(nvrhi::GpuVirtualAddress);
@@ -760,7 +757,7 @@ void ClusterLodPreloaded::InitClas(
         blasAddressesBuffer.Create(numGeom, "ClusterLodBlasAddresses", device);
 
         // Optional sizes buffer (required by some nvrhi backends for ImplicitDestinations).
-        RTXMGBuffer<uint32_t> blasSizesBuffer;
+        ClusterOperationSizesBuffer blasSizesBuffer;
         blasSizesBuffer.Create(numGeom, "ClusterLodBlasSizes", device);
 
         {

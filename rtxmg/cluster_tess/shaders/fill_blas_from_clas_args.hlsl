@@ -32,5 +32,6 @@ void main(uint3 threadIdx : SV_DispatchThreadID)
     nvrhi::rt::cluster::IndirectArgs args = (nvrhi::rt::cluster::IndirectArgs)0;
     args.clusterCount = offsetCount.y;
     args.clusterAddresses = g_Params.clasAddressesBaseAddress + sizeof(nvrhi::GpuVirtualAddress) * offsetCount.x;
+    args.clusterAddressStride = 8;
     u_BlasFromClasArgs[instanceIndex] = args;
 }

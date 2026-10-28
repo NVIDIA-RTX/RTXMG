@@ -76,6 +76,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstring>
+#include <unordered_set>
 
 #include <donut/core/log.h>
 #include <nvrhi/nvrhiHLSL.h>      // for nvrhi::rt::cluster::IndirectArgs (BLAS-build descriptor)
@@ -85,6 +86,7 @@
 #include "rtxmg/cluster_lod/streaming.h"
 #include "rtxmg/profiler/statistics.h"  // per-phase Cluster Lod GPU timers (AccelBuilder tab)
 #include "rtxmg/utils/bindless_layout.h"
+#include "rtxmg/utils/cluster_operation.h"
 
 namespace rtxmg {
 
@@ -217,7 +219,7 @@ bool ClusterLodStreaming::Init(const std::vector<GeometryView>&        geometrie
         d.keepInitialState   = true;
         d.debugName          = "ClusterLodStreamingShaderBuffer";
         m_shaderBuffer.Create(d, device);
-        m_operationsSize += m_shaderBuffer.GetBytes();
+        m_operationsSize += m_shaderBuffer.GetVramBytes();
     }
 
     // Placeholder for streaming slots with no backing buffer in the current
@@ -408,22 +410,18 @@ void ClusterLodStreaming::ResetGeometryStreamingState(nvrhi::ICommandList* comma
     {
         PersistentGeometry& persistentGeometry = m_persistentGeometries[geometryIndex];
 
-        const uint32_t groupCount = persistentGeometry.streamingGroupAddresses.GetNumElements();
+        const GeometryMetadataSlice<shaderio::GroupAddress>& slice =
+            persistentGeometry.streamingGroupAddresses;
         std::vector<shaderio::GroupAddress> groupAddresses(
-            groupCount, shaderio::GroupAddress{ shaderio::kStreamingInvalidSrvIndex, 0u });
+            slice.numElements, shaderio::GroupAddress{ shaderio::kStreamingInvalidSrvIndex, 0u });
 
         const StreamingResident::Group* residentGroup =
             m_resident.FindGroup(GeometryGroup{uint32_t(geometryIndex),
                                                persistentGeometry.lastLodGroupOffset});
         assert(residentGroup);
-        (void)residentGroup;
-        groupAddresses[persistentGeometry.lastLodGroupOffset] = {
-            uint32_t(persistentGeometry.lowDetailGroupsDataSRVHandle.GetIndexInHeap()),
-            0u,
-        };
-        commandList->writeBuffer(persistentGeometry.streamingGroupAddresses,
-                                 groupAddresses.data(),
-                                 groupAddresses.size() * sizeof(shaderio::GroupAddress));
+        groupAddresses[persistentGeometry.lastLodGroupOffset] = residentGroup->groupAddress;
+        commandList->writeBuffer(slice.buffer, groupAddresses.data(), slice.ByteSize(),
+                                 slice.ByteOffset());
 
         // also reset the number of groups loaded per lod-level, except last which is also always loaded.
         const uint32_t maxLodLevel = persistentGeometry.lodLevelsCount - 1;
@@ -685,6 +683,31 @@ void ClusterLodStreaming::InitGeometries(
                         std::chrono::steady_clock::time_point b)
     { return std::chrono::duration<double, std::milli>(b - a).count(); };
 
+    // Lay out every geometry's low-detail group blob in one shared buffer.
+    std::vector<uint64_t> lowDetailOffsets(numGeom);
+    uint64_t              lowDetailBytes = 0;
+    for (size_t geometryIndex = 0; geometryIndex < numGeom; geometryIndex++)
+    {
+        const GeometryView& sceneGeometry = geometries[geometryIndex];
+        assert(sceneGeometry.lodLevelsCount != 0);
+        const shaderio::LodLevel& lastLodLevel = sceneGeometry.lodLevels[sceneGeometry.lodLevelsCount - 1];
+        lowDetailOffsets[geometryIndex] = lowDetailBytes;
+        lowDetailBytes += rtxmg::align_up(
+            uint64_t(sceneGeometry.groupInfos[lastLodLevel.groupOffset].GetDeviceSize()), uint64_t(16));
+    }
+    if (lowDetailBytes > UINT32_MAX)
+        donut::log::fatal("ClusterLodStreaming: low-detail groups need %llu bytes; GroupAddress "
+                          "offsets are 32-bit.", (unsigned long long)lowDetailBytes);
+    m_lowDetailGroupsData = {};
+    m_lowDetailGroupsData.Create(size_t(lowDetailBytes), "ClusterLodStreaming::lowDetailGroupsData", device);
+    // Hit shaders reconstruct triangle payload from the scene-global resident
+    // cluster-address table. The persistent low-detail blobs are outside the
+    // streaming storage allocator, so they need their own bindless raw SRV.
+    m_lowDetailGroupsDataSRVHandle = descriptorTable->CreateDescriptorHandle(
+        nvrhi::BindingSetItem::RawBuffer_SRV(0, m_lowDetailGroupsData.GetBuffer()));
+    const uint32_t lowDetailGroupsDataSRV = uint32_t(m_lowDetailGroupsDataSRVHandle.GetIndexInHeap());
+    const nvrhi::GpuVirtualAddress lowDetailGroupsDataVA = m_lowDetailGroupsData.GetGpuVirtualAddress();
+
     uint32_t instancesOffset = 0;
     for (size_t geometryIndex = 0; geometryIndex < numGeom; geometryIndex++)
     {
@@ -694,20 +717,16 @@ void ClusterLodStreaming::InitGeometries(
 
         const auto tMeta0 = std::chrono::steady_clock::now();
 
-        // Shared per-geom upload — creates the LoD-tree + flat-metadata buffers,
-        // registers their bindless SRVs, and fills the base fields of
-        // shaderGeometry.  The streaming-only extras are filled below.
+        // Shared per-geom setup — adopts the scene's pre-built LoD-tree buffers and
+        // bindless SRVs, and fills the base fields of shaderGeometry.  The
+        // streaming-only extras are filled below.
         UploadGeometryMetadata(geometryIndex, sceneGeometry,
                                persistentGeometry, shaderGeometry,
-                               instancesOffset, instanceCount[geometryIndex],
-                               descriptorTable, device, commandList);
+                               instancesOffset, instanceCount[geometryIndex]);
         instancesOffset += instanceCount[geometryIndex];
 
         const auto tMeta1 = std::chrono::steady_clock::now();
         msMeta += msBetween(tMeta0, tMeta1);
-
-        m_persistentGeometrySize += persistentGeometry.lodNodes.GetBytes();
-        m_persistentGeometrySize += persistentGeometry.lodNodeBboxes.GetBytes();
 
         // Cached scalars used by reset paths / StageResidencyUpdate.  The importer drops
         // geometries with no LOD hierarchy, so numLodLevels is never 0 here — the
@@ -733,20 +752,11 @@ void ClusterLodStreaming::InitGeometries(
 
         const uint32_t lastClustersCount = uint32_t(groupInfo.clusterCount);
         const uint64_t lastGroupSize     = groupInfo.GetDeviceSize();
+        const uint64_t lowDetailOffset   = lowDetailOffsets[geometryIndex];
 
-        persistentGeometry.lowDetailGroupsData.Create(
-            uint32_t(lastGroupSize), "ClusterLodStreaming::lowDetailGroupsData", device);
-        m_persistentGeometrySize += persistentGeometry.lowDetailGroupsData.GetBytes();
-
-        // Hit shaders reconstruct triangle payload from the scene-global
-        // resident cluster-address table. The persistent low-detail blob is
-        // outside the streaming storage allocator, so it needs its own bindless
-        // raw SRV.
-        persistentGeometry.lowDetailGroupsDataSRVHandle = descriptorTable->CreateDescriptorHandle(
-            nvrhi::BindingSetItem::RawBuffer_SRV(0, persistentGeometry.lowDetailGroupsData.GetBuffer()));
         const shaderio::GroupAddress lowDetailGroupAddress = {
-            uint32_t(persistentGeometry.lowDetailGroupsDataSRVHandle.GetIndexInHeap()),
-            0u,
+            lowDetailGroupsDataSRV,
+            uint32_t(lowDetailOffset),
         };
 
         GeometryGroup geometryGroup{uint32_t(geometryIndex), lastLodLevel.groupOffset};
@@ -756,9 +766,7 @@ void ClusterLodStreaming::InitGeometries(
             donut::log::fatal("ClusterLodStreaming: no residency slot for geometry %u's low-detail "
                        "group (%u clusters). Raise --maxresidentgroups.",
                        uint32_t(geometryIndex), lastClustersCount);
-        // The persistent low-detail blob is its own buffer, not a suballocation
-        // out of the streaming storage, so its VA is the buffer's.
-        rgroup->deviceAddress = persistentGeometry.lowDetailGroupsData.GetBuffer()->getGpuVirtualAddress();
+        rgroup->deviceAddress = lowDetailGroupsDataVA + lowDetailOffset;
         rgroup->groupAddress  = lowDetailGroupAddress;
         rgroup->lodLevel      = groupInfo.lodLevel;
 
@@ -771,8 +779,8 @@ void ClusterLodStreaming::InitGeometries(
                                rgroup->clusterResidentID,
                                rgroup->groupResidentID,
                                loGroupData.data(), loGroupData.size());
-        commandList->writeBuffer(persistentGeometry.lowDetailGroupsData.GetBuffer(),
-                                 loGroupData.data(), loGroupData.size());
+        commandList->writeBuffer(m_lowDetailGroupsData.GetBuffer(),
+                                 loGroupData.data(), loGroupData.size(), lowDetailOffset);
 
 
         const shaderio::BBox& lowDetailBBox = groupView.clusterBboxes[0];
@@ -785,6 +793,22 @@ void ClusterLodStreaming::InitGeometries(
         shaderGeometry.bbox.longestEdge = lowDetailBBox.longestEdge / lowDetailBBoxExtent;
 
         msLowDetail += msBetween(tMeta1, std::chrono::steady_clock::now());
+    }
+
+    // Geometries share metadata buffers (one set per scene-load batch), so count
+    // each buffer once at its real size.
+    {
+        std::unordered_set<nvrhi::IBuffer*> metadataBuffers;
+        for (const PersistentGeometry& pg : m_persistentGeometries)
+        {
+            metadataBuffers.insert(pg.lodLevels.buffer);
+            metadataBuffers.insert(pg.lodNodes.buffer);
+            metadataBuffers.insert(pg.lodNodeBboxes.buffer);
+            metadataBuffers.insert(pg.streamingGroupAddresses.buffer);
+        }
+        m_persistentGeometrySize = m_lowDetailGroupsData.GetVramBytes();
+        for (nvrhi::IBuffer* buffer : metadataBuffers)
+            m_persistentGeometrySize += rtxmg::BufferVramBytes(buffer);
     }
 
     donut::log::info("ClusterLodStreaming InitGeometries: metadata upload %.0f ms, "
@@ -855,7 +879,7 @@ void ClusterLodStreaming::InitGeometries(
 
     // ---- Upload shader-geometry table ---------------------------------------
     m_shaderGeometriesBuffer.Create(uint32_t(numGeom), "ClusterLodShaderGeometries", device);
-    m_operationsSize += m_shaderGeometriesBuffer.GetBytes();
+    m_operationsSize += m_shaderGeometriesBuffer.GetVramBytes();
     commandList->writeBuffer(m_shaderGeometriesBuffer.GetBuffer(),
                              m_shaderGeometries.data(),
                              numGeom * sizeof(shaderio::Geometry));
@@ -2326,8 +2350,8 @@ void ClusterLodStreaming::GetStats(StreamingStats& stats) const
     stats.persistentTriangles = resident.persistentTriangles;
 
     stats.operationsBytes     = GetOperationsSize();
-    stats.persistentDataBytes = m_persistentGeometrySize;
-    stats.persistentClasBytes = m_clasLowDetailSize;
+    stats.persistentDataBytes = GetPersistentDataBytes();
+    stats.persistentClasBytes = m_clasLowDetailBuffer.GetVramBytes();
     stats.residentNormals = !m_config.stripResidentNormals;
 
     if (m_config.allowBlasCaching)
@@ -2430,11 +2454,11 @@ size_t ClusterLodStreaming::GetGeometrySize(bool reserved) const
 
     if (reserved)
     {
-        return m_persistentGeometrySize + pool.reservedDataBytes;
+        return GetPersistentDataBytes() + pool.reservedDataBytes;
     }
     else
     {
-        return m_persistentGeometrySize + pool.usedDataBytes;
+        return GetPersistentDataBytes() + pool.usedDataBytes;
     }
 }
 
@@ -2536,13 +2560,13 @@ void ClusterLodStreaming::Deinit()
     m_storageTaskQueue.Deinit();
     m_updatesTaskQueue.Deinit();
 
-    for (auto& pg : m_persistentGeometries)
-    {
-        pg.lowDetailGroupsData.Release();
-        // The BaseGeometry-owned buffers and their descriptor handles release
-        // through their destructors when m_persistentGeometries clears below.
-    }
+    // The BaseGeometry slices and their descriptor handles release through their
+    // destructors when m_persistentGeometries clears.
     m_persistentGeometries.clear();
+    m_lowDetailGroupsDataSRVHandle.Reset();
+    m_lowDetailGroupsData.Release();
+    m_lowDetailClasGeometryIndices.Release();
+    m_persistentGeometrySize = 0;
 
     m_shaderGeometriesBuffer.Release();
     m_renderInstancesBuffer.Release();   // inherited
@@ -2603,15 +2627,15 @@ bool ClusterLodStreaming::InitShadersAndPipelines(donut::engine::ShaderFactory* 
     using donut::engine::ShaderMacro;
 
     auto loadCS = [&](nvrhi::ShaderHandle& out,
-                      const char*          path,
+                      const std::string&   path,
                       std::vector<ShaderMacro> defines = {}) -> bool
     {
-        out = shaderFactory->CreateShader(path, "main",
+        out = shaderFactory->CreateShader(path.c_str(), "main",
                                           defines.empty() ? nullptr : &defines,
                                           nvrhi::ShaderType::Compute);
         if (!out)
         {
-            donut::log::error("ClusterLodStreaming: failed to load %s", path);
+            donut::log::error("ClusterLodStreaming: failed to load %s", path.c_str());
             return false;
         }
         return true;
@@ -2624,11 +2648,14 @@ bool ClusterLodStreaming::InitShadersAndPipelines(donut::engine::ShaderFactory* 
         return std::vector<ShaderMacro>{ {"HAS_ALPHA_TEST", hasAlpha} };
     };
 
+    // Shaders that use the cluster-operation layouts come in one build per cluster API.
+    auto clusterApiPath = [device](const char* path) { return GetClusterApiShaderPath(device, path); };
+
     bool ok = true;
     ok &= loadCS(m_shaders.computeAgeFilterGroups,    "cluster_lod/stream_age_groups.hlsl");
-    ok &= loadCS(m_shaders.computeSetup,              "cluster_lod/stream_dispatch_setup.hlsl");
-    ok &= loadCS(m_shaders.computeUpdateScene[0], "cluster_lod/stream_update_scene.hlsl", sceneMacros("0"));
-    ok &= loadCS(m_shaders.computeUpdateScene[1], "cluster_lod/stream_update_scene.hlsl", sceneMacros("1"));
+    ok &= loadCS(m_shaders.computeSetup,              clusterApiPath("cluster_lod/stream_dispatch_setup.hlsl"));
+    ok &= loadCS(m_shaders.computeUpdateScene[0], clusterApiPath("cluster_lod/stream_update_scene.hlsl"), sceneMacros("0"));
+    ok &= loadCS(m_shaders.computeUpdateScene[1], clusterApiPath("cluster_lod/stream_update_scene.hlsl"), sceneMacros("1"));
 
     // Mixed-cluster alpha-mask geometry-indices fill shader, dispatched
     // indirectly from ApplyResidencyUpdate between stream_update_scene (which
@@ -2640,7 +2667,7 @@ bool ClusterLodStreaming::InitShadersAndPipelines(donut::engine::ShaderFactory* 
     {
         ok &= loadCS(m_shaders.computeAllocatorBuildFreeGaps,  "cluster_lod/stream_allocator_scan_gaps.hlsl");
         ok &= loadCS(m_shaders.computeAllocatorFreeGapsInsert, "cluster_lod/stream_allocator_bin_gaps.hlsl");
-        ok &= loadCS(m_shaders.computeAllocatorLoadGroups,     "cluster_lod/stream_allocator_alloc_groups.hlsl");
+        ok &= loadCS(m_shaders.computeAllocatorLoadGroups,     clusterApiPath("cluster_lod/stream_allocator_alloc_groups.hlsl"));
         ok &= loadCS(m_shaders.computeAllocatorSetupInsertion, "cluster_lod/stream_allocator_bin_offsets.hlsl");
         ok &= loadCS(m_shaders.computeAllocatorUnloadGroups,   "cluster_lod/stream_allocator_free_groups.hlsl");
     }
@@ -2650,7 +2677,7 @@ bool ClusterLodStreaming::InitShadersAndPipelines(donut::engine::ShaderFactory* 
         // defrag old resident CLAS to the pool base and append newly built
         // CLAS after them.
         ok &= loadCS(m_shaders.computeCompactionClasOld, "cluster_lod/stream_compact_defrag_old.hlsl");
-        ok &= loadCS(m_shaders.computeCompactionClasNew, "cluster_lod/stream_compact_append_new.hlsl");
+        ok &= loadCS(m_shaders.computeCompactionClasNew, clusterApiPath("cluster_lod/stream_compact_append_new.hlsl"));
     }
 
     if (!ok)
@@ -2870,6 +2897,7 @@ void ClusterLodStreaming::InitClasSizing(nvrhi::IDevice* device, uint32_t maxNew
 
     m_clasTriangleInput.minPositionTruncateBitCount = m_clasPositionTruncateBits;
     m_clasTriangleInput.vertexFormat              = nvrhi::Format::RGB32_FLOAT;
+    m_clasTriangleInput.indexFormat               = cluster::OperationIndexFormat::IndexFormat8bit;
 
     // (1) Implicit build, maxNewPerFrameClusters
     {
@@ -2966,7 +2994,7 @@ ClusterLodStreaming::BuildLowDetailClasArgs(nvrhi::IDevice*      device,
     // order) and one IndirectTriangleClasArgs per cluster.  Geometry, group blob
     // and group VA all come off the resident Group itself rather than being
     // re-derived from a parallel geometry index.
-    std::vector<cluster::IndirectTriangleClasArgs> clasArgs(loClustersCount);
+    std::vector<cluster::nv::IndirectTriangleClasArgs> clasArgs(loClustersCount);
     std::vector<cluster::IndirectArgs>             blasArgs(loGroupsCount);
     const nvrhi::GpuVirtualAddress                 residentClasAddressesVA =
         m_resident.GetClasAddressesBuffer().GetGpuVirtualAddress();
@@ -2976,12 +3004,16 @@ ClusterLodStreaming::BuildLowDetailClasArgs(nvrhi::IDevice*      device,
 
     std::vector<uint8_t> devBlob;  // decompression scratch, reused per group
 
+    // Mixed-cluster entries of every group + their (cluster-cursor → offset)
+    // map.  Usually the lowest LoD is single-material and needs neither.
+    std::vector<nvrhi::rt::cluster::GeometryIndexAndFlags> mixedEntries;
+    std::vector<std::pair<uint32_t, uint32_t>> mixedClusterCursorOffsets;
+
     for (uint32_t g = 0; g < loGroupsCount; ++g)
     {
         const StreamingResident::Group& rg         = groups[g];
         const uint32_t                  geometryID = rg.geometryGroup.geometryID;
         const uint32_t                  groupID    = rg.geometryGroup.groupID;
-        PersistentGeometry&             pgeom      = m_persistentGeometries[geometryID];
         const GeometryView&             geom       = m_geometries[geometryID];
 
         const GroupInfo&  groupInfo = geom.groupInfos[groupID];
@@ -3005,16 +3037,11 @@ ClusterLodStreaming::BuildLowDetailClasArgs(nvrhi::IDevice*      device,
         }
 
         blasArgs[g].clusterCount     = rg.clusterCount;
-        blasArgs[g].reserved         = 0;
+        blasArgs[g].clusterAddressStride = 8;
         blasArgs[g].clusterAddresses = residentClasAddressesVA
                                        + uint64_t(rg.clusterResidentID) * sizeof(nvrhi::GpuVirtualAddress);
 
         const nvrhi::GpuVirtualAddress groupBaseVA = rg.deviceAddress;
-
-        // Mixed-cluster entries + their (cluster-cursor → offset) map, built
-        // lazily: usually the lowest LoD is single-material and needs neither.
-        std::vector<nvrhi::rt::cluster::GeometryIndexAndFlags> mixedEntries;
-        std::vector<std::pair<uint32_t, uint32_t>> mixedClusterCursorOffsets;
 
         for (uint32_t c = 0; c < groupInfo.clusterCount; ++c)
         {
@@ -3032,7 +3059,7 @@ ClusterLodStreaming::BuildLowDetailClasArgs(nvrhi::IDevice*      device,
                 + uint32_t(sizeof(shaderio::Cluster)) * c;
             const nvrhi::GpuVirtualAddress clusterVA = groupBaseVA + clusterHdrOff;
 
-            cluster::IndirectTriangleClasArgs& arg = clasArgs[clusterCursor];
+            cluster::nv::IndirectTriangleClasArgs& arg = clasArgs[clusterCursor];
             arg = {};
             // CLAS encodes the allocator-issued cluster resident ID; the hit
             // shader's GetClusterID() reads this back and indexes directly
@@ -3053,7 +3080,7 @@ ClusterLodStreaming::BuildLowDetailClasArgs(nvrhi::IDevice*      device,
 
             // Uniform clusters encode baseGeometryIndexAndFlags from
             // Cluster::stateBits; mixed ones get per-triangle entries in
-            // pgeom.lowDetailClasGeometryIndices.  With materials off, every
+            // m_lowDetailClasGeometryIndices.  With materials off, every
             // cluster is forced opaque/single-sided/material 0, so it is never
             // mixed and no per-triangle buffer is needed.  The alpha-mask
             // geometry slot only exists when the scene has alpha-masked
@@ -3100,23 +3127,24 @@ ClusterLodStreaming::BuildLowDetailClasArgs(nvrhi::IDevice*      device,
 
             ++clusterCursor;
         }
-
-        // Upload the per-geometry mixed-cluster buffer + patch pointers.
-        if (!mixedEntries.empty())
-        {
-            pgeom.lowDetailClasGeometryIndices.Create(
-                uint32_t(mixedEntries.size()), "ClusterLodStreamingLoDetailGeomIndices", device);
-            commandList->writeBuffer(pgeom.lowDetailClasGeometryIndices,
-                                     mixedEntries.data(),
-                                     mixedEntries.size() * sizeof(nvrhi::rt::cluster::GeometryIndexAndFlags));
-            const nvrhi::GpuVirtualAddress baseVA =
-                pgeom.lowDetailClasGeometryIndices.GetGpuVirtualAddress();
-            for (auto [cur, off] : mixedClusterCursorOffsets)
-                clasArgs[cur].geometryIndexAndFlagsBuffer =
-                    baseVA + uint64_t(off) * sizeof(nvrhi::rt::cluster::GeometryIndexAndFlags);
-        }
     }
     assert(clusterCursor == loClustersCount);
+
+    // Upload the mixed-cluster entries + patch pointers.
+    m_lowDetailClasGeometryIndices.Release();
+    if (!mixedEntries.empty())
+    {
+        m_lowDetailClasGeometryIndices.Create(
+            uint32_t(mixedEntries.size()), "ClusterLodStreamingLoDetailGeomIndices", device);
+        commandList->writeBuffer(m_lowDetailClasGeometryIndices,
+                                 mixedEntries.data(),
+                                 mixedEntries.size() * sizeof(nvrhi::rt::cluster::GeometryIndexAndFlags));
+        const nvrhi::GpuVirtualAddress baseVA =
+            m_lowDetailClasGeometryIndices.GetGpuVirtualAddress();
+        for (auto [cur, off] : mixedClusterCursorOffsets)
+            clasArgs[cur].geometryIndexAndFlagsBuffer =
+                baseVA + uint64_t(off) * sizeof(nvrhi::rt::cluster::GeometryIndexAndFlags);
+    }
 
     LowDetailClasArgs result;
     result.clasArgs.swap(clasArgs);
@@ -3136,7 +3164,7 @@ void ClusterLodStreaming::BuildLowDetailClas(nvrhi::IDevice*          device,
                                              const LowDetailClasArgs& lowDetail)
 {
     namespace cluster = nvrhi::rt::cluster;
-    const std::vector<cluster::IndirectTriangleClasArgs>& clasArgs = lowDetail.clasArgs;
+    const std::vector<cluster::nv::IndirectTriangleClasArgs>& clasArgs = lowDetail.clasArgs;
     const uint32_t loClustersCount = lowDetail.clustersCount;
     const uint32_t maxTri   = lowDetail.maxTriangleCount;
     const uint32_t maxVtx   = lowDetail.maxVertexCount;
@@ -3144,18 +3172,14 @@ void ClusterLodStreaming::BuildLowDetailClas(nvrhi::IDevice*          device,
     const uint32_t totalVtx = lowDetail.totalVertexCount;
 
     // ----- GetSizes pass to query per-cluster CLAS byte sizes ----------------
-    RTXMGBuffer<cluster::IndirectTriangleClasArgs> clasArgsBuffer;
-    {
-        auto desc = GetGenericDesc(loClustersCount,
-                                   uint32_t(sizeof(cluster::IndirectTriangleClasArgs)),
-                                   "ClusterLodStreamingClasArgsBuffer")
-                        .setIsAccelStructBuildInput(true);
-        clasArgsBuffer.Create(desc, device);
-        commandList->writeBuffer(clasArgsBuffer.GetBuffer(), clasArgs.data(),
-                                 loClustersCount * sizeof(cluster::IndirectTriangleClasArgs));
-    }
+    const nvrhi::BufferHandle clasArgsBuffer = CreateAndUploadClusterArgs(
+        clasArgs,
+        GetGenericDesc(loClustersCount, uint32_t(sizeof(cluster::nv::IndirectTriangleClasArgs)),
+                       "ClusterLodStreamingClasArgsBuffer")
+            .setIsAccelStructBuildInput(true),
+        commandList);
 
-    RTXMGBuffer<uint32_t>                 tempSizes;
+    ClusterOperationSizesBuffer           tempSizes;
     RTXMGBuffer<nvrhi::GpuVirtualAddress> tempAddrs;
     tempSizes.Create(loClustersCount, "ClusterLodStreamingClasSizesTemp",     device);
     tempAddrs.Create(loClustersCount, "ClusterLodStreamingClasAddressesTemp", device);
@@ -3177,6 +3201,7 @@ void ClusterLodStreaming::BuildLowDetailClas(nvrhi::IDevice*          device,
     clasParams.clas.maxTotalTriangleCount       = totalTri;
     clasParams.clas.maxTotalVertexCount         = totalVtx;
     clasParams.clas.minPositionTruncateBitCount = m_clasPositionTruncateBits;
+    clasParams.clas.indexFormat                 = cluster::OperationIndexFormat::IndexFormat8bit;
 
     cluster::OperationSizeInfo clasSizeInfo = device->getClusterOperationSizeInfo(clasParams);
 
@@ -3184,7 +3209,7 @@ void ClusterLodStreaming::BuildLowDetailClas(nvrhi::IDevice*          device,
         cluster::OperationDesc getSizesDesc = {};
         getSizesDesc.params               = clasParams;
         getSizesDesc.scratchSizeInBytes   = clasSizeInfo.scratchSizeInBytes;
-        getSizesDesc.inIndirectArgsBuffer = clasArgsBuffer.GetBuffer();
+        getSizesDesc.inIndirectArgsBuffer = clasArgsBuffer;
         getSizesDesc.outSizesBuffer       = tempSizes.GetBuffer();
         commandList->executeMultiIndirectClusterOperation(getSizesDesc);
     }
@@ -3192,7 +3217,7 @@ void ClusterLodStreaming::BuildLowDetailClas(nvrhi::IDevice*          device,
     // compute size, storage of lo-res geometry and destination addresses etc.
 
     uint64_t totalClasSize = 0;
-    const std::vector<uint32_t> clasSizes = tempSizes.Download(commandList);
+    const std::vector<uint64_t> clasSizes = tempSizes.Download(commandList);
     // A failed map returns an empty vector; DebugReadbackMoveArgs bounds the
     // same pattern, these two did not.
     if (clasSizes.size() < loClustersCount)
@@ -3237,7 +3262,7 @@ void ClusterLodStreaming::BuildLowDetailClas(nvrhi::IDevice*          device,
         cluster::OperationDesc buildDesc = {};
         buildDesc.params               = clasParams;
         buildDesc.scratchSizeInBytes   = clasSizeInfo.scratchSizeInBytes;
-        buildDesc.inIndirectArgsBuffer = clasArgsBuffer.GetBuffer();
+        buildDesc.inIndirectArgsBuffer = clasArgsBuffer;
         buildDesc.inOutAddressesBuffer = tempAddrs.GetBuffer();
         commandList->executeMultiIndirectClusterOperation(buildDesc);
     }
@@ -3255,8 +3280,11 @@ void ClusterLodStreaming::BuildLowDetailClas(nvrhi::IDevice*          device,
                              clasAddrs.data(),
                              loClustersCount * sizeof(nvrhi::GpuVirtualAddress),
                              0);
+    std::vector<uint32_t> residentClasSizes(loClustersCount);
+    for (uint32_t c = 0; c < loClustersCount; ++c)
+        residentClasSizes[c] = uint32_t(clasSizes[c]);
     commandList->writeBuffer(m_resident.GetClasSizesBuffer(),
-                             clasSizes.data(),
+                             residentClasSizes.data(),
                              loClustersCount * sizeof(uint32_t),
                              0);
 
@@ -3317,7 +3345,7 @@ void ClusterLodStreaming::BuildLowDetailBlas(nvrhi::IDevice*          device,
 
     RTXMGBuffer<nvrhi::GpuVirtualAddress> blasAddrsBuffer;
     blasAddrsBuffer.Create(uint32_t(numGeom), "ClusterLodStreamingBlasAddresses", device);
-    RTXMGBuffer<uint32_t>                 blasSizesBuffer;
+    ClusterOperationSizesBuffer           blasSizesBuffer;
     blasSizesBuffer.Create(uint32_t(numGeom), "ClusterLodStreamingBlasSizes",    device);
 
     {
@@ -3359,9 +3387,8 @@ bool ClusterLodStreaming::CreatePerFrameClasBuffers(nvrhi::IDevice* device,
     m_maxNewClustersPerFrame = maxNewPerFrameClusters;
     {
         nvrhi::BufferDesc d;
-        d.byteSize              = uint64_t(m_maxNewClustersPerFrame)
-                                   * sizeof(cluster::IndirectTriangleClasArgs);
-        d.structStride          = sizeof(cluster::IndirectTriangleClasArgs);
+        d.structStride          = GetTriangleClasArgsBytes(device);
+        d.byteSize              = uint64_t(m_maxNewClustersPerFrame) * d.structStride;
         d.isAccelStructBuildInput = true;
         d.canHaveUAVs           = true;
         d.canHaveRawViews       = true;
@@ -3406,10 +3433,9 @@ bool ClusterLodStreaming::CreatePerFrameClasBuffers(nvrhi::IDevice* device,
             return false;
     }
 
-    m_clasOperationsSize += m_clasIndirectArgsBuffer->getDesc().byteSize
-                          + m_clasScratchBuffer->getDesc().byteSize;
-    if (m_clasGeometryIndicesDispatchBuffer)
-        m_clasOperationsSize += m_clasGeometryIndicesDispatchBuffer->getDesc().byteSize;
+    m_clasOperationsSize += rtxmg::BufferVramBytes(m_clasIndirectArgsBuffer)
+                          + rtxmg::BufferVramBytes(m_clasScratchBuffer)
+                          + rtxmg::BufferVramBytes(m_clasGeometryIndicesDispatchBuffer);
 
     return true;
 }

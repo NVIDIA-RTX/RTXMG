@@ -166,13 +166,13 @@ void ClusterLodBlasPass::Init(
 
 uint64_t ClusterLodBlasPass::GetMetadataBytes() const
 {
-    return m_blasArgs.GetBytes()
-         + m_blasClasAddrs.GetBytes()
-         + m_blasAddresses.GetBytes()
-         + m_blasSizes.GetBytes()
-         + m_perGeomSeen.GetBytes()
-         + m_cachedBlasAddressesSrc.GetBytes()
-         + m_cachedBlasAddressesDst.GetBytes();
+    return m_blasArgs.GetVramBytes()
+         + m_blasClasAddrs.GetVramBytes()
+         + m_blasAddresses.GetVramBytes()
+         + m_blasSizes.GetVramBytes()
+         + m_perGeomSeen.GetVramBytes()
+         + m_cachedBlasAddressesSrc.GetVramBytes()
+         + m_cachedBlasAddressesDst.GetVramBytes();
 }
 
 // ---------------------------------------------------------------------------

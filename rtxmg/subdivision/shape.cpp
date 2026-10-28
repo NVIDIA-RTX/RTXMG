@@ -94,7 +94,7 @@ ParseMtllib(const char* m_filepath)
         case 'n':
         {
             char name[256] = { "" };
-            if (sscanf_s(line, "newmtl %255s", name, 256) == 1)
+            if (sscanf(line, "newmtl %255s", name) == 1)
             {
                 mtl = mtls.emplace_back(std::make_unique<Shape::material>()).get();
                 mtl->name = name;
@@ -102,7 +102,7 @@ ParseMtllib(const char* m_filepath)
         } break;
         case 'K':
             NEED_MTL();
-            mtl_assert(sscanf_s(line + 2, " %f %f %f", &r, &g, &b) == 3, "Missing RGB values");
+            mtl_assert(sscanf(line + 2, " %f %f %f", &r, &g, &b) == 3, "Missing RGB values");
             switch (line[1])
             {
             case 'a':
@@ -131,7 +131,7 @@ ParseMtllib(const char* m_filepath)
             break;
         case 'N':
             NEED_MTL();
-            mtl_assert(sscanf_s(line + 2, " %f", &a) == 1, "Missing N value");
+            mtl_assert(sscanf(line + 2, " %f", &a) == 1, "Missing N value");
             switch (line[1])
             {
             case 's':
@@ -146,12 +146,12 @@ ParseMtllib(const char* m_filepath)
             break;
         case 'd':
             NEED_MTL();
-            mtl_assert(sscanf_s(line, "d %f", &a) == 1, "malformed dissolve");
+            mtl_assert(sscanf(line, "d %f", &a) == 1, "malformed dissolve");
             mtl->d = a;
             break;
         case 'T':
             NEED_MTL();
-            mtl_assert(sscanf_s(line, "Tf %f %f %f", &r, &g, &b) == 3, "Malformed transmission filter");
+            mtl_assert(sscanf(line, "Tf %f %f %f", &r, &g, &b) == 3, "Malformed transmission filter");
             mtl->tf[0] = r;
             mtl->tf[1] = g;
             mtl->tf[2] = b;
@@ -159,12 +159,12 @@ ParseMtllib(const char* m_filepath)
         case 'i':
             NEED_MTL();
             int illum;
-            mtl_assert(sscanf_s(line, "illum %d", &illum) == 1, "Malformed illum");
+            mtl_assert(sscanf(line, "illum %d", &illum) == 1, "Malformed illum");
             mtl->illum = illum;
             break;
         case 's':
             NEED_MTL();
-            if (sscanf_s(line, "sharpness %f", &a) == 1)
+            if (sscanf(line, "sharpness %f", &a) == 1)
                 mtl->sharpness = a;
             break;
         case 'm':
@@ -176,7 +176,7 @@ ParseMtllib(const char* m_filepath)
                 switch (line[4])
                 {
                 case 'K':
-                    mtl_assert(sscanf_s(line + 6, " %1023s", buf, 1024) == 1, "Malformed map_K line");
+                    mtl_assert(sscanf(line + 6, " %1023s", buf) == 1, "Malformed map_K line");
                     switch (line[5])
                     {
                     case 'a':
@@ -194,12 +194,12 @@ ParseMtllib(const char* m_filepath)
                     }
                     break;
                 case 'B':
-                    if (sscanf_s(line + 5, "ump -bm %f -bb %f %1023s", &mtl->bm, &mtl->bb,
-                        buf, 1024) == 3)
+                    if (sscanf(line + 5, "ump -bm %f -bb %f %1023s", &mtl->bm, &mtl->bb,
+                        buf) == 3)
                         mtl->map_bump = buf;
-                    else if (sscanf_s(line + 5, "ump -bm %f %1023s", &mtl->bm, buf, 1024) == 2)
+                    else if (sscanf(line + 5, "ump -bm %f %1023s", &mtl->bm, buf) == 2)
                         mtl->map_bump = buf;
-                    else if (sscanf_s(line + 5, "ump %1023s", buf, 1024) == 1)
+                    else if (sscanf(line + 5, "ump %1023s", buf) == 1)
                         mtl->map_bump = buf;
                     else mtl_assert(false, "Malformed bump map line");
                     break;
@@ -207,11 +207,11 @@ ParseMtllib(const char* m_filepath)
                     switch (line[5])
                     {
                     case 'r':
-                        mtl_assert(sscanf_s(line + 5, "r %1023s", buf, 1024) == 1, "Malformed map_Pr line");
+                        mtl_assert(sscanf(line + 5, "r %1023s", buf) == 1, "Malformed map_Pr line");
                         mtl->map_pr = buf;
                         break;
                     case 'm':
-                        mtl_assert(sscanf_s(line + 5, "m %1023s", buf, 1024) == 1, "Malformed map_Pm line");
+                        mtl_assert(sscanf(line + 5, "m %1023s", buf) == 1, "Malformed map_Pm line");
                         mtl->map_pm = buf;
                         break;
                     default:
@@ -219,11 +219,11 @@ ParseMtllib(const char* m_filepath)
                     }
                     break;
                 case 'R':
-                    mtl_assert(sscanf_s(line + 5, "ma %1023s", buf, 1024) == 1, "Malformed map_R line");
+                    mtl_assert(sscanf(line + 5, "ma %1023s", buf) == 1, "Malformed map_R line");
                     mtl->map_rma = buf;
                     break;
                 case 'O':
-                    mtl_assert(sscanf_s(line + 5, "rm %1023s", buf, 1024) == 1, "Malformed map_KO line");
+                    mtl_assert(sscanf(line + 5, "rm %1023s", buf) == 1, "Malformed map_KO line");
                     mtl->map_orm = buf;
                     break;
                 }
@@ -234,22 +234,22 @@ ParseMtllib(const char* m_filepath)
             switch (line[1])
             {
             case 'r':
-                mtl_assert(sscanf_s(line + 2, " %f", &mtl->Pr) == 1, "Malformed Pr line");
+                mtl_assert(sscanf(line + 2, " %f", &mtl->Pr) == 1, "Malformed Pr line");
                 break;
             case 'm':
-                mtl_assert(sscanf_s(line + 2, " %f", &mtl->Pm) == 1, "Malformed Pm line");
+                mtl_assert(sscanf(line + 2, " %f", &mtl->Pm) == 1, "Malformed Pm line");
                 break;
             case 's':
-                mtl_assert(sscanf_s(line + 2, " %f", &mtl->Ps) == 1, "Malformed Ps line");
+                mtl_assert(sscanf(line + 2, " %f", &mtl->Ps) == 1, "Malformed Ps line");
                 break;
             case 'c':
                 switch (line[2])
                 {
                 case ' ':
-                    mtl_assert(sscanf_s(line + 2, " %f", &mtl->Pc) == 1, "Malformed Pc line");
+                    mtl_assert(sscanf(line + 2, " %f", &mtl->Pc) == 1, "Malformed Pc line");
                     break;
                 case 'r':
-                    mtl_assert(sscanf_s(line + 3, " %f", &mtl->Pcr) == 1, "Malformed Pcr line");
+                    mtl_assert(sscanf(line + 3, " %f", &mtl->Pcr) == 1, "Malformed Pcr line");
                     break;
                 }
             }
@@ -258,9 +258,9 @@ ParseMtllib(const char* m_filepath)
             NEED_MTL();
             {
                 float a = 0.f;
-                if (sscanf_s(line, "aniso %f", &a) == 1)
+                if (sscanf(line, "aniso %f", &a) == 1)
                     mtl->aniso = a;
-                else if (sscanf_s(line, "anisor %f", &a) == 1)
+                else if (sscanf(line, "anisor %f", &a) == 1)
                     mtl->anisor = a;
                 else mtl_assert(false, "Malformed aniso line");
             }
@@ -406,17 +406,17 @@ std::unique_ptr<Shape> parseObj(char const* m_filepath, Scheme shapescheme,
             ++ptr;
             if (*ptr == ' ')
             {
-                obj_assert(sscanf_s(ptr, " %255s%n", groupName, 256, &delta) == 1, "Malformed group name");
+                obj_assert(sscanf(ptr, " %255s%n", groupName, &delta) == 1, "Malformed group name");
                 ptr += delta;
             }
             break;
         case 'u':
-            obj_assert(sscanf_s(ptr, "usemtl %255s%n", buf, 256, &delta) == 1, "Malformed usemtl");
+            obj_assert(sscanf(ptr, "usemtl %255s%n", buf, &delta) == 1, "Malformed usemtl");
             usemtl = static_cast<short>(s->FindMaterial(buf));
             ptr += delta;
             break;
         case 'm':
-            obj_assert(sscanf_s(ptr, "mtllib %255s%n", buf, 256, &delta) == 1, "Malformed mtllib");
+            obj_assert(sscanf(ptr, "mtllib %255s%n", buf, &delta) == 1, "Malformed mtllib");
             if (parseMaterials)
             {
                 fs::path p = buf;
@@ -433,7 +433,7 @@ std::unique_ptr<Shape> parseObj(char const* m_filepath, Scheme shapescheme,
             ptr += delta;
             break;
         case 'c':
-            obj_assert(sscanf_s(ptr, "capslib %255s%n", buf, 256, &delta) == 1, "Malformed capslib");
+            obj_assert(sscanf(ptr, "capslib %255s%n", buf, &delta) == 1, "Malformed capslib");
             if (parseMaterials)
             {
                 fs::path p = buf;
@@ -462,7 +462,7 @@ bool Shape::tag::ParseTag(char const* cp, tag* t)
 
     while (*cp == ' ')
         cp++;
-    if (sscanf_s(cp, "%255s", buf, 256) != 1)
+    if (sscanf(cp, "%255s", buf) != 1)
         return false;
     while (*cp && *cp != ' ')
         cp++;
@@ -471,7 +471,7 @@ bool Shape::tag::ParseTag(char const* cp, tag* t)
     int nints = 0, nfloats = 0, nstrings = 0;
     while (*cp == ' ')
         cp++;
-    if (sscanf_s(cp, "%d/%d/%d", &nints, &nfloats, &nstrings) != 3)
+    if (sscanf(cp, "%d/%d/%d", &nints, &nfloats, &nstrings) != 3)
         return false;
     while (*cp && *cp != ' ')
         cp++;
@@ -482,7 +482,7 @@ bool Shape::tag::ParseTag(char const* cp, tag* t)
         int val;
         while (*cp == ' ')
             cp++;
-        if (sscanf_s(cp, "%d", &val) != 1)
+        if (sscanf(cp, "%d", &val) != 1)
             return false;
         t->intargs.push_back(val);
         while (*cp && *cp != ' ')
@@ -495,7 +495,7 @@ bool Shape::tag::ParseTag(char const* cp, tag* t)
         float val;
         while (*cp == ' ')
             cp++;
-        if (sscanf_s(cp, "%f", &val) != 1)
+        if (sscanf(cp, "%f", &val) != 1)
             return false;
         t->floatargs.push_back(val);
         while (*cp && *cp != ' ')
@@ -508,7 +508,7 @@ bool Shape::tag::ParseTag(char const* cp, tag* t)
         char val[512];
         while (*cp == ' ')
             cp++;
-        if (sscanf_s(cp, "%511s", val, 512) != 1)
+        if (sscanf(cp, "%511s", val) != 1)
             return false;
         t->stringargs.push_back(std::string(val));
         while (*cp && *cp != ' ')
@@ -865,7 +865,7 @@ static std::vector<uint32_t> findUdims(fs::path const& basepath, Shape::material
                     for (auto const& entry : fs::directory_iterator(dir))
                     {
                         int id;
-                        if (sscanf_s(entry.path().filename().generic_string().c_str(), pattern.c_str(), &id) == 1)
+                        if (sscanf(entry.path().filename().generic_string().c_str(), pattern.c_str(), &id) == 1)
                             udims.push_back(id);
                     }
 

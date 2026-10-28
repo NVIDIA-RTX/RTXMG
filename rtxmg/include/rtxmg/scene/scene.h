@@ -21,6 +21,7 @@
 #include "rtxmg/cluster_lod/gltf_model.h"
 #include "rtxmg/cluster_lod/resources_base.h"  // ClusterLodPrebuiltGeometryMetadata
 
+#include "rtxmg/subdivision/subdivision_surface.h"
 #include "rtxmg/subdivision/topology_map.h"
 #include "rtxmg/cluster_tess/cluster_tessellator.h"
 
@@ -37,6 +38,7 @@
 
 #include <nvrhi/nvrhi.h>
 
+#include <atomic>
 #include <string>
 #include <unordered_map>
 
@@ -82,6 +84,10 @@ struct RTXMGSceneParams
     // Optional override for the cluster-LoD shard cache directory.  Empty derives
     // a shared "_nvsngeocache" folder next to the gltf instead.
     fs::path clusterCacheDir;
+    // Parallel bake worker count; 0 derives it from the core count and RAM.
+    uint32_t clusterBakeWorkers = 0;
+    // Polled during the load; once set, LoadWithThreadPool bails and returns false.
+    const std::atomic<bool>* cancelLoad = nullptr;
 };
 
 class RTXMGScene
@@ -105,8 +111,8 @@ public:
     explicit RTXMGScene(const RTXMGSceneParams& params);
     ~RTXMGScene();
 
-    // outRecordedCommandLists, when given, receives the closed upload list instead
-    // of it being submitted here — so this can run off the main thread.
+    // outRecordedCommandLists, when given, receives the closed upload lists instead
+    // of them being submitted here — so this can run off the main thread.
     bool LoadWithThreadPool(const std::filesystem::path& filename,
         ThreadPool* threadPool,
         std::vector<nvrhi::CommandListHandle>* outRecordedCommandLists = nullptr);
@@ -116,25 +122,6 @@ public:
     void SetTextureBaseMips(std::unordered_map<std::string, uint32_t> baseMips)
     {
         m_textureLoader.SetBaseMips(std::move(baseMips));
-    }
-
-    // Hands a cluster-LOD import result to the scene, keyed by gltf path, so the
-    // next LoadWithThreadPool consumes it instead of re-baking.  This is what lets
-    // the slow shard mmap / bake run on the load thread behind the loading screen.
-    void AddPrebakedClusterModel(const std::filesystem::path& gltfPath, ClusterLodModel&& model,
-                                 std::vector<ClusterLodPrebuiltGeometryMetadata>&& metadata = {})
-    {
-        m_prebakedClusterModels.push_back({ gltfPath.lexically_normal(),
-                                            std::move(model), std::move(metadata) });
-    }
-
-    // Budgeted pump for the per-geometry GPU metadata pre-upload; budgetMs <= 0
-    // finishes everything, and it returns true once every geometry is done.
-    // MAIN thread only — GPU work on the load thread races Streamline's present.
-    bool PumpClusterLodPrebuiltMetadataUploads(nvrhi::ICommandList* commandList, double budgetMs);
-    bool IsClusterLodPrebuiltMetadataComplete() const
-    {
-        return m_clusterLodPrebuiltCursor >= m_clusterLodGeometries.size();
     }
 
     void FinishedLoading(nvrhi::ICommandList* commandList);
@@ -236,6 +223,16 @@ public:
     std::span<Instance>       GetSubdMeshInstances()       { return m_subdInstances; }
     std::span<Instance const> GetSubdMeshInstances() const { return m_subdInstances; }
     uint32_t TotalSubdPatchCount() const;
+    // Subd meshes, their animation poses and the topology maps.
+    uint64_t GetSubdVramBytes() const;
+
+    std::span<SubdivisionSurface::Pose const> GetSubdPoses() const { return m_subdPoses; }
+    // Null for an instance of a static mesh, which reads the mesh's rest pose.
+    const SubdivisionSurface::Pose* GetSubdPose(const Instance& instance) const;
+    // SRV of the instance's current positions: its pose slice, or the rest pose.
+    nvrhi::BindingSetItem GetSubdPositions(uint32_t slot, const Instance& instance) const;
+    nvrhi::IBuffer* GetSubdPatchPoints(const Instance& instance) const;
+    box3 GetSubdAabb(const Instance& instance) const;  // object space, current frame
 
     const View* GetView() const { return m_view.get(); }
 
@@ -298,6 +295,9 @@ private:
     std::vector<std::unique_ptr<TopologyMap const>> m_topologyMaps;
     std::vector<std::unique_ptr<SubdivisionSurface>> m_subdMeshes;
     std::vector<Instance> m_subdInstances;
+    std::vector<SubdivisionSurface::Pose> m_subdPoses;
+    // One pose per (animated mesh, frame offset); sets each Instance::poseID.
+    void BuildSubdPoses(nvrhi::ICommandList* commandList);
     std::shared_ptr<donut::engine::CommonRenderPasses> m_commonPasses;
 
     // Cluster LOD CPU data
@@ -313,23 +313,44 @@ private:
     bool                                 m_logClusterLod = false;
     BakerConfig                          m_clusterBakerConfig;
     fs::path                             m_clusterCacheDir;  // shard-cache override (testing)
-    // CPU import results handed in via AddPrebakedClusterModel(), keyed by
-    // normalized gltf path and consumed by the matching import instead of a rebake.
-    struct PrebakedClusterModel
+    uint32_t                             m_clusterBakeWorkers = 0;
+    const std::atomic<bool>*             m_cancelLoad = nullptr;
+    bool IsLoadCancelled() const { return m_cancelLoad && m_cancelLoad->load(std::memory_order_relaxed); }
+
+    // Valid only inside LoadWithThreadPool: the pool the metadata build fans out
+    // over, and the per-worker upload lists it records.
+    ThreadPool*                           m_loadThreadPool = nullptr;
+    std::vector<nvrhi::CommandListHandle> m_metadataCommandLists;
+
+    // Each gltf of the current load, keyed by normalized path, with its instances
+    // as first inserted; later references only add instances.
+    struct InsertedClusterModel
     {
-        std::filesystem::path                     path;
-        ClusterLodModel                           model;
-        std::vector<ClusterLodPrebuiltGeometryMetadata> metadata;  // may be empty
+        std::filesystem::path           path;
+        std::vector<ClusterLodInstance> instances;
     };
-    std::vector<PrebakedClusterModel> m_prebakedClusterModels;
-    // Take the prebaked entry for `gltfPath` if one was handed in.
-    std::optional<PrebakedClusterModel> TakePrebakedClusterModel(const std::filesystem::path& gltfPath);
-    // Appends a model's geometries plus its (possibly empty / partial) pre-built
-    // metadata, keeping m_clusterLodPrebuiltMetadata index-aligned with the geometries.
-    void InsertClusterLodModelWithMetadata(ClusterLodModel&& model,
-                                           std::vector<ClusterLodPrebuiltGeometryMetadata>&& metadata);
-    // Pre-upload pump cursor (see PumpClusterLodPrebuiltMetadataUploads).
-    size_t m_clusterLodPrebuiltCursor = 0;
+    std::vector<InsertedClusterModel> m_insertedClusterModels;
+
+    // Each OBJ of the current load, keyed by resolved path, with its mesh.
+    struct InsertedSubdModel
+    {
+        std::filesystem::path path;
+        uint32_t              meshID;
+    };
+    std::vector<InsertedSubdModel> m_insertedSubdModels;
+
+    // Imports the OBJ once per load and adds `instance` of it on every call.
+    void InsertSubdObj(const std::filesystem::path& objPath, const std::string& modelName,
+                       const Instance& instance, ObjImporter& objImporter,
+                       nvrhi::ICommandList* commandList);
+
+    // Inserts the gltf at `gltfPath` once per load and instances it under
+    // `nodeTransform` on every call.
+    bool InsertClusterLodGltf(const std::filesystem::path& gltfPath, const affine3& nodeTransform,
+                              nvrhi::ICommandList* commandList);
+    // Appends a model's geometries and builds their GPU metadata, keeping
+    // m_clusterLodPrebuiltMetadata index-aligned with the geometries.
+    void InsertClusterLodModelWithMetadata(ClusterLodModel&& model, nvrhi::ICommandList* commandList);
 
     // Scene-wide cluster-LoD aggregation stats — reduced across
     // m_clusterLodGeometries in LoadWithThreadPool alongside the AABB pass.

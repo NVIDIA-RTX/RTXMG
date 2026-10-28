@@ -52,6 +52,7 @@
 // ToFloat4x4.  Occluded nodes coarsen via errorScale (soft, RT-safe).
 #if CLUSTER_LOD_HIZ_OCCLUSION
 #include "culling.hlsli"
+#include "rtxmg/utils/wave_size.hlsli"
 Texture2D<float> t_ClusterLodHiZ[HIZ_MAX_LODS] : register(t0, space1);
 SamplerState     s_ClusterLodHiZSampler        : register(s0, space1);
 #endif
@@ -390,6 +391,7 @@ void ProcessAllSubTasks(inout shaderio::TraversalInfo traversalInfo,
 // passes and reads the final group queue on the last pass.
 ////////////////////////////////////////////
 
+RTXMG_WAVE_SIZE_32
 [numthreads(shaderio::kTraversalRunThreads, 1, 1)]
 void main(uint3 dtid : SV_DispatchThreadID,
           uint  gtid : SV_GroupIndex)

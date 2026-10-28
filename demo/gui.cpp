@@ -524,7 +524,7 @@ void UserInterface::RegisterMidiBindings()
     });
     KORGI_BUTTON_CALLBACK(0, Cycle, [this]()
     {
-        GetApp().ResetCamera();
+        GetApp().ResetView();
     });
     KORGI_BUTTON_CALLBACK(0, S2, [this]()
     {
@@ -786,7 +786,50 @@ void UserInterface::BuildSceneSection(ImVec2 itemSize)
     if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen))
     {
         if (ImGui::Button("Reset Camera"))
-            m_app.ResetCamera();
+            m_app.ResetView();
+
+        ImGui::SameLine();
+        if (ImGui::Button("Shot List..."))
+            m_app.GetUIData().showShotListWindow = true;
+
+        // Tracks the live camera until edited; an edit sticks until applied or
+        // cleared, so a pasted string isn't overwritten before it's used.
+        if (!m_cameraStringEdited)
+            m_cameraStringBuf = m_app.GetCameraString();
+        char camBuf[512] = { 0 };
+        std::strncpy(camBuf, m_cameraStringBuf.c_str(), std::size(camBuf) - 1);
+        ImGui::SetNextItemWidth(-ImGui::GetFrameHeight() - ImGui::GetStyle().ItemSpacing.x);
+        const bool camEnter = ImGui::InputText("##CameraString", camBuf, std::size(camBuf),
+                                               ImGuiInputTextFlags_EnterReturnsTrue);
+        if (camBuf != m_cameraStringBuf)
+        {
+            m_cameraStringBuf     = camBuf;
+            m_cameraStringEdited  = !m_cameraStringBuf.empty();
+            m_cameraStringInvalid = false;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("[eye][lookat][up]fovY -- same syntax as -p.\n"
+                              "Paste a camera and press Enter or the arrow to jump.\n"
+                              "Clear the field to follow the live camera again.");
+        ImGui::SameLine();
+        ImGui::PushFont(m_iconicFont);
+        const bool camGo = ImGui::Button((char const*)(u8"\ue093" "##camera go"),
+                                         { ImGui::GetFrameHeight(), 0.f });
+        ImGui::PopFont();
+        if (camEnter || camGo)
+        {
+            m_cameraStringInvalid = !m_app.SetCameraString(m_cameraStringBuf);
+            if (!m_cameraStringInvalid)
+                m_cameraStringEdited = false;
+        }
+        if (m_cameraStringInvalid)
+            ImGui::TextColored(UI_RED, "Not a valid camera: [eye][lookat][up]fovY");
+
+        float fovY = m_app.GetCameraFovY();
+        if (ImGui::SliderFloat("FOV", &fovY, 5.f, 120.f, "%.1f deg"))
+            m_app.SetCameraFovY(fovY);
+        if (ImGui::IsItemHovered() && ImGui::GetCurrentContext()->HoveredIdTimer > .5f)
+            ImGui::SetTooltip("Vertical field of view. Alt + mouse wheel zooms too.");
 
         bool updateLodCamera = m_app.GetUpdateLodCamera();
         if (ImGui::Checkbox("Update LOD Camera", &updateLodCamera))
@@ -991,10 +1034,14 @@ void UserInterface::BuildRenderingSection(ImVec2 itemSize)
         if (!denoiserEnabled && renderer.GetEffectiveShadingMode() == ShadingMode::PT)
         {
             bool timeView = renderer.GetTimeView();
+            ImGui::BeginDisabled(!renderer.IsTimeViewSupported());
             if (ImGui::Checkbox("Heatmap", &timeView))
             {
                 renderer.SetTimeView(timeView);
             }
+            ImGui::EndDisabled();
+            if (!renderer.IsTimeViewSupported() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Needs the NVAPI shader extensions on D3D12.");
             ImGui::SameLine();
 
             int spp = static_cast<int>(std::sqrt(renderer.GetSPP()) - 1);
@@ -1255,7 +1302,7 @@ void UserInterface::BuildClusterLodSection()
                 ImGui::Spacing();
                 if (ImGui::Button("Reload", ImVec2(90, 0)))
                 {
-                    ApplyStagedPoolBudgets();
+                    ApplyStagedPoolBudgets(false);
                     m_app.ApplyTextureSettingsAndReload(m_staged.textureBudgetMB, m_staged.normalMaps);
                     m_stagedValid = false;
                     ImGui::CloseCurrentPopup();
@@ -1293,8 +1340,24 @@ void UserInterface::BuildClusterLodSection()
                                   "below the slider value.");
             if (adaptiveLodError)
             {
+                // The controller's load is the max of the geometry and CLAS pool occupancy.
+                const float effective = renderer.GetEffectiveLodPixelError();
+                const float ratio = effective / lodPixelError;
+                const char* limiter = "";
+                rtxmg::StreamingStats s;
+                if (ratio > 1.f && renderer.GetClusterLodStreamingStats(s))
+                {
+                    const double geo  = s.maxDataBytes ? double(s.usedDataBytes) / double(s.maxDataBytes) : 0.0;
+                    const double clas = s.reservedClasBytes
+                        ? double(s.usedClasBytes + s.wastedClasBytes) / double(s.reservedClasBytes) : 0.0;
+                    limiter = clas >= geo ? ", CLAS" : ", geometry";
+                }
+                const ImVec4 color = ratio > 1.25f ? ImVec4(1.0f, 0.45f, 0.40f, 1.f)
+                                   : ratio > 1.f   ? ImVec4(1.0f, 0.85f, 0.25f, 1.f)
+                                                   : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
                 ImGui::SameLine();
-                ImGui::TextDisabled("(%.3f)", renderer.GetEffectiveLodPixelError());
+                ImGui::TextColored(color, "(%.3f, load %.0f%%%s)", effective,
+                                   100.f * renderer.GetAdaptiveLodLoad(), limiter);
             }
         }
 
@@ -1446,20 +1509,21 @@ void UserInterface::SyncStagedBudgets()
 }
 
 // Everything the Apply button commits that does not need a scene reload.
-void UserInterface::ApplyStagedPoolBudgets()
+void UserInterface::ApplyStagedPoolBudgets(bool reallocate)
 {
-    auto& renderer = m_app.GetRenderer();
-
-    if (renderer.GetClusterLodResources())
+    if (m_app.GetRenderer().GetClusterLodResources())
     {
-        renderer.SetMaxResidentGroups(uint32_t(std::max(1, m_staged.maxResidentGroups)));
-        renderer.SetMaxGeometryMB(uint32_t(std::max(1, m_staged.geometryPoolMB)));
-        renderer.SetGeometryBlockMB(uint32_t(std::max(1, m_staged.geometryBlockMB)));
-        renderer.SetMaxClasMB(uint32_t(std::max(1, m_staged.clasPoolMB)));
-        renderer.SetMaxBlasCachingMB(uint32_t(std::max(1, m_staged.blasCachingPoolMB)));
-        renderer.SetMaxFrameLoadRequests(uint32_t(std::max(1, m_staged.maxLoadsPerFrame)));
-        renderer.SetRenderClusterBits(std::clamp(uint32_t(m_staged.renderClusterBits), 16u, 25u));
-        m_app.ApplyStreamingBudgets();
+        ClusterLodBudgets b = m_app.GetClusterLodBudgets();
+        b.maxResidentGroups    = uint32_t(std::max(1, m_staged.maxResidentGroups));
+        b.maxGeometryMB        = uint32_t(std::max(1, m_staged.geometryPoolMB));
+        b.geometryBlockMB      = uint32_t(std::max(1, m_staged.geometryBlockMB));
+        b.maxClasMB            = uint32_t(std::max(1, m_staged.clasPoolMB));
+        b.maxBlasCachingMB     = uint32_t(std::max(1, m_staged.blasCachingPoolMB));
+        b.maxFrameLoadRequests = uint32_t(std::max(1, m_staged.maxLoadsPerFrame));
+        b.renderClusterBits    = std::clamp(uint32_t(m_staged.renderClusterBits), 16u, 25u);
+        m_app.SetClusterLodBudgets(b);
+        if (reallocate)
+            m_app.ApplyStreamingBudgets();
     }
 
     TessellatorConfig::MemorySettings ms = m_app.GetTessMemSettings();
@@ -1482,7 +1546,7 @@ uint64_t UserInterface::ProposedBytes(const StagedBudgets& s)
         tm.budgetableCount == 0
             ? vb.textures
             : (texCap ? std::min(texCap, tm.budgetableFullBytes) : tm.budgetableFullBytes)
-              + tm.loadedOtherBytes;
+              + tm.loadedOtherBytes + tm.VramPaddingBytes();
 
     const bool hasClod = m_app.GetRenderer().GetClusterLodResources() != nullptr;
     const bool hasTess = !m_app.GetScene().GetSubdMeshes().empty();
@@ -1494,8 +1558,8 @@ uint64_t UserInterface::ProposedBytes(const StagedBudgets& s)
     const uint64_t tessClas  = hasTess ? uint64_t(std::max(0, s.tessClasMB))        << 20 : 0;
 
     return textures + clodGeo + clodClas + cachedBlas + vb.clodMetadata
-         + tessVert + tessClas + vb.tessClusterData
-         + vb.blas + vb.renderTargets + vb.envmap + vb.Unaccounted();
+         + tessVert + tessClas + vb.tessClusterData + vb.tessSurfaces
+         + vb.blas + vb.asScratch + vb.dlss + vb.renderTargets + vb.envmap + vb.Unaccounted();
 }
 
 // A staged field: highlighted while it differs from the live value, and unable
@@ -1635,6 +1699,32 @@ void UserInterface::BuildTessellationSection()
             ImGui::SetTooltip("Tessellation rates for metric:\n"
                 "- Fine: Affects primary visible ray geometry\n"
                 "- Coarse: Affects \"culled\" geometry: offscreen, backfacing, occluded\n");
+
+        bool adaptiveTessRate = m_app.GetAdaptiveTessRate();
+        if (ImGui::Checkbox("Adaptive##tessrate", &adaptiveTessRate))
+            m_app.SetAdaptiveTessRate(adaptiveTessRate);
+        if (ImGui::IsItemHovered() && ImGui::GetCurrentContext()->HoveredIdTimer > .5f)
+            ImGui::SetTooltip("Lower the tessellation rates on the GPU when a tessellation\n"
+                              "budget (max clusters / CLAS / vertex memory) passes 85%%, in\n"
+                              "one step to 75%%, and recover slowly below 60%%, so clusters\n"
+                              "are coarsened instead of dropped.  Never finer than the sliders.");
+        if (adaptiveTessRate)
+        {
+            const ClusterTessStatistics& stats = m_app.GetBuildStats();
+            const float scale = stats.tessRateScale;
+            const char* limiter = scale >= 1.f ? ""
+                : scale == stats.clusterRateScale ? ", clusters"
+                : scale == stats.clasRateScale ? ", CLAS" : ", vertices";
+            const ImVec4 color = scale < 0.75f ? ImVec4(1.0f, 0.45f, 0.40f, 1.f)
+                               : scale < 1.f   ? ImVec4(1.0f, 0.85f, 0.25f, 1.f)
+                                                : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+            ImGui::SameLine();
+            ImGui::TextColored(color, "(%.3f | %.3f, load %.0f%%%s)", tessRates[0] * scale, tessRates[1] * scale,
+                               100.f * m_app.GetTessBudgetLoad(), limiter);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Rate scale %.3f; per budget: clusters %.3f, CLAS %.3f, vertices %.3f",
+                                  scale, stats.clusterRateScale, stats.clasRateScale, stats.vertexRateScale);
+        }
 
         TessellatorConfig::AdaptiveTessellationMode tessMode = m_app.GetAdaptiveTessellationMode();
         if (ImGuiComboFromArray("Tessellation Metric", &tessMode, kAdaptiveTessellationModeNames))
@@ -1940,6 +2030,7 @@ void UserInterface::BuildUIMain(int2 screenLayoutSize)
     BuildBakeConfigWindow();
     BuildBakeReportWindow();
     BuildGridInstancingWindow();
+    BuildShotListWindow();
     BuildHelpWindow();
 }
 
@@ -1989,7 +2080,7 @@ void UserInterface::BuildHelpWindow()
         { "Shift (hold)",   "Move 3x faster" },
         { "Ctrl (hold)",    "Move 10x finer" },
         { "Alt (hold)",     "Orbit mode" },
-        { "F",              "Reset camera to the scene default" },
+        { "F",              "Reset camera and exposure to the startup defaults" },
         { "C",              "Print the camera parameters to stdout" },
         { "/",              "Freeze / unfreeze the LOD camera" },
     };
@@ -2229,8 +2320,11 @@ void UserInterface::BuildVramBudgetWindow()
     const ImVec4 kColTess      (0.50f, 0.36f, 0.14f, 1.f);
     const ImVec4 kColTessClas  (0.62f, 0.46f, 0.18f, 1.f);
     const ImVec4 kColTessData  (0.72f, 0.56f, 0.26f, 1.f);
+    const ImVec4 kColTessSurf  (0.40f, 0.30f, 0.12f, 1.f);
     const ImVec4 kColBlas      (0.36f, 0.22f, 0.46f, 1.f);
+    const ImVec4 kColScratch   (0.48f, 0.34f, 0.58f, 1.f);
     const ImVec4 kColTargets   (0.46f, 0.20f, 0.30f, 1.f);
+    const ImVec4 kColDlss      (0.60f, 0.30f, 0.42f, 1.f);
     const ImVec4 kColOther     (0.34f, 0.34f, 0.34f, 1.f);
 
     // Three stacks over the same buckets: what the card has actually given up,
@@ -2246,7 +2340,7 @@ void UserInterface::BuildVramBudgetWindow()
         if (tm.budgetableCount == 0)
             return vb.textures;
         return (cap ? std::min(cap, tm.budgetableFullBytes) : tm.budgetableFullBytes)
-               + tm.loadedOtherBytes;
+               + tm.loadedOtherBytes + tm.VramPaddingBytes();
     };
     auto mb = [](int v) { return uint64_t(std::max(0, v)) << 20; };
 
@@ -2260,7 +2354,9 @@ void UserInterface::BuildVramBudgetWindow()
         { "Textures", vb.textures, vb.textures,
           texBytesFor(liveB.textureBudgetMB), texBytesFor(m_staged.textureBudgetMB), false, kColTextures,
           "Material textures resident on the GPU. The budget is met by dropping\n"
-          "high-resolution mips at load, so it only moves on a scene reload." },
+          "high-resolution mips at load, so it only moves on a scene reload.\n"
+          "Includes the 64 KB page and mip-tail padding; the budget itself counts\n"
+          "packed mip bytes, so the budget columns add today's padding on top." },
         { "Cluster LOD Geometry", vb.clodGeometryUsed, vb.clodGeometry,
           hasClod ? mb(liveB.geometryPoolMB) : 0, hasClod ? mb(m_staged.geometryPoolMB) : 0, true, kColClodGeo,
           "Per-cluster vertex attributes of the resident LOD groups (quantized\n"
@@ -2295,17 +2391,35 @@ void UserInterface::BuildVramBudgetWindow()
         { "Cluster Tess Shading Data", vb.tessClusterDataUsed, vb.tessClusterData,
           vb.tessClusterData, vb.tessClusterData, true, kColTessData,
           "Per-cluster surface descriptors the hit shader reads to evaluate the\n"
-          "limit surface. Sized by Max Clusters, not by a byte budget." },
-        { "BLAS + scratch", vb.blas, vb.blas, vb.blas, vb.blas, false, kColBlas,
-          "Bottom-level acceleration structures over both geometry paths, and the\n"
-          "build scratch. Just-sized from the scene, so there is no budget." },
+          "limit surface, and the per-cluster CLAS build arguments. Sized by\n"
+          "Max Clusters, not by a byte budget." },
+        { "Subdivision Surfaces", vb.tessSurfaces, vb.tessSurfaces,
+          vb.tessSurfaces, vb.tessSurfaces, false, kColTessSurf,
+          "The subdivision meshes the tessellator reads: surface tables, patch\n"
+          "points, topology maps, animation keyframes and one posed copy (with\n"
+          "its own patch points) per animation offset, plus the tessellator's\n"
+          "per-instance and per-patch buffers. Sized by the scene, not budgeted." },
+        { "BLAS + TLAS", vb.blasUsed, vb.blas, vb.blas, vb.blas, true, kColBlas,
+          "Bottom-level acceleration structures over both geometry paths, the\n"
+          "TLAS and its instance descs. The dynamic BLAS buffers are sized for\n"
+          "the worst case; Used is what this frame built in them. Just-sized from\n"
+          "the scene, so there is no budget." },
+        { "AS build scratch", vb.asScratch, vb.asScratch, vb.asScratch, vb.asScratch, false, kColScratch,
+          "nvrhi's scratch pool for acceleration-structure builds and cluster\n"
+          "operations. Grows to the largest set of builds in flight and never\n"
+          "shrinks while the command list lives." },
         { "Render targets", rt, rt, rt, rt, false, kColTargets,
           "Output and history textures: the path-tracer targets, denoiser set,\n"
-          "HiZ chain, z-prepass and the environment map. Scales with resolution." },
+          "HiZ chain, z-prepass, and the environment map with its sampling\n"
+          "tables. Scales with resolution." },
+        { "DLSS", vb.dlss, vb.dlss, vb.dlss, vb.dlss, false, kColDlss,
+          "Streamline's own estimate of the DLSS and DLSS-RR features' internal\n"
+          "resources. Scales with output resolution; a feature stays allocated\n"
+          "after switching the denoiser away from it." },
         { "Unaccounted", unaccount, unaccount, unaccount, unaccount, false, kColOther,
-          "Driver total minus the buckets above: DLSS/NGX, nvrhi's descriptor\n"
-          "heaps, the cluster_tess working buffers, and driver overhead." },
-    };
+          "Driver total minus the buckets above: nvrhi's descriptor heaps, upload\n"
+          "buffers the driver places in CPU-visible VRAM, and driver overhead such\n"
+          "as the ray-tracing stack and cluster-operation internals." },    };
 
     ImGui::TextUnformatted("Allocated");
     VramStackBar("##alloc", segs, int(std::size(segs)), capacity,
@@ -2375,7 +2489,7 @@ void UserInterface::BuildVramBudgetWindow()
         ImGui::EndTable();
     }
     if (!vb.driverValid)
-        ImGui::TextDisabled("(no driver VRAM query on this API - DLSS/driver allocations are invisible)");
+        ImGui::TextDisabled("(no driver VRAM query on this API - driver allocations are invisible)");
     } // Buckets
 
     ImGui::Spacing();
@@ -2476,7 +2590,7 @@ void UserInterface::BuildVramBudgetWindow()
             ImGui::OpenPopup("##VramReloadConfirm");
         else
         {
-            ApplyStagedPoolBudgets();
+            ApplyStagedPoolBudgets(true);
             SyncStagedBudgets();
         }
     }
@@ -2518,7 +2632,7 @@ void UserInterface::BuildVramBudgetWindow()
         if (ImGui::Button("Reload", ImVec2(90, 0)))
         {
             // Pool budgets ride along, so one Apply commits everything staged.
-            ApplyStagedPoolBudgets();
+            ApplyStagedPoolBudgets(false);
             m_app.ApplyTextureSettingsAndReload(m_staged.textureBudgetMB, m_staged.normalMaps);
             m_stagedValid = false;  // re-sync from the reloaded scene
             ImGui::CloseCurrentPopup();
@@ -3339,9 +3453,17 @@ void UserInterface::Animate(float elapsedTimeSeconds)
 {
     ImGui_Renderer::Animate(elapsedTimeSeconds);
 
-    if (GetApp().GetUIData().timeLineEditorState.IsPlaying())
+    auto& timeline = GetApp().GetUIData().timeLineEditorState;
+#if RTXMG_DEV_FEATURES
+    if (const float step = m_app.GetArgs().animStep; step > 0.f && timeline.frameRate > 0.f)
     {
-        GetApp().GetUIData().timeLineEditorState.Update(elapsedTimeSeconds);
+        timeline.mode = TimeLineEditorState::Playback::Play;
+        elapsedTimeSeconds = step / timeline.frameRate;
+    }
+#endif
+    if (timeline.IsPlaying())
+    {
+        timeline.Update(elapsedTimeSeconds);
     }
 }
 
@@ -3848,10 +3970,10 @@ bool UserInterface::FolderDialog(std::string& m_filepath)
 
     if (gotname && chars[0] != '\0')
     {
-        filepath = chars;
+        m_filepath = chars;
 
         // trim newline at end that zenity inserts
-        filepath.erase(filepath.find_last_not_of(" \n\r\t") + 1);
+        m_filepath.erase(m_filepath.find_last_not_of(" \n\r\t") + 1);
 
         return true;
     }
@@ -3865,6 +3987,7 @@ bool UserInterface::FileDialog(bool bOpen, char const* filters,
 #ifdef _WIN32
     IFileOpenDialog* dlg;
     wchar_t* path = NULL;
+    bool picked = false;
     // Create the FileOpenDialog object.
     HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_ALL,
         IID_IFileOpenDialog, (LPVOID*)&dlg);
@@ -3903,6 +4026,23 @@ bool UserInterface::FileDialog(bool bOpen, char const* filters,
             dlg->SetFileTypes((uint32_t)filterSpecs.size(), filterSpecs.data());
         }
 
+        // Start in the incoming path's folder rather than wherever the shell last was.
+        if (!m_filepath.empty())
+        {
+            const std::filesystem::path current = m_filepath;
+            const std::filesystem::path folder  = std::filesystem::is_directory(current)
+                                                    ? current : current.parent_path();
+            IShellItem* folderItem = nullptr;
+            if (SUCCEEDED(SHCreateItemFromParsingName(std::filesystem::absolute(folder).c_str(), nullptr,
+                                                      IID_PPV_ARGS(&folderItem))))
+            {
+                dlg->SetFolder(folderItem);
+                folderItem->Release();
+            }
+            if (!std::filesystem::is_directory(current))
+                dlg->SetFileName(current.filename().c_str());
+        }
+
         hr = dlg->Show(NULL);
         if (SUCCEEDED(hr))
         {
@@ -3915,13 +4055,14 @@ bool UserInterface::FileDialog(bool bOpen, char const* filters,
                 std::wstring_convert<std::codecvt_utf8<wchar_t>, wchar_t> converter;
 
                 m_filepath = converter.to_bytes(path);
+                picked     = true;
 
                 pItem->Release();
             }
         }
         dlg->Release();
     }
-    return true;
+    return picked;
 #else  // _WIN32
     // minimal implementation avoiding a GUI library, ignores filters for now,
     // and relies on external 'zenity' program commonly available on linuxoids
@@ -3937,10 +4078,10 @@ bool UserInterface::FileDialog(bool bOpen, char const* filters,
 
     if (gotname && chars[0] != '\0')
     {
-        filepath = chars;
+        m_filepath = chars;
 
         // trim newline at end that zenity inserts
-        filepath.erase(filepath.find_last_not_of(" \n\r\t") + 1);
+        m_filepath.erase(m_filepath.find_last_not_of(" \n\r\t") + 1);
 
         return true;
     }
@@ -4124,3 +4265,296 @@ void UserInterface::SetupAudioEngine() {}
 void UserInterface::SetupAudioVoice(const std::string& wavepath, float startTime) {}
 void UserInterface::MuteAudio(bool) {}
 #endif
+
+// "zorah.v1.scene.json" -> "zorah.v1.shot_list.json", "Board.gltf" -> "Board.shot_list.json"
+static std::filesystem::path DefaultShotListPath(const std::string& sceneFile)
+{
+    const std::filesystem::path scene = sceneFile;
+    std::string                 stem  = scene.filename().string();
+    constexpr std::string_view  kSceneSuffix = ".scene.json";
+    if (stem.ends_with(kSceneSuffix))
+        stem.resize(stem.size() - kSceneSuffix.size());
+    else
+        stem = scene.stem().string();
+    return scene.parent_path() / (stem + ".shot_list.json");
+}
+
+void UserInterface::BuildShotListWindow()
+{
+    UIData& uiData = m_app.GetUIData();
+    if (!uiData.showShotListWindow)
+    {
+        m_shotListWindowOpen = false;
+        return;
+    }
+    m_shotListWindowOpen = true;
+
+    // Re-reads the file and keeps the config selection when its size didn't
+    // change (our writers only ever touch "positions").
+    auto reload = [this]()
+    {
+        std::vector<ShotPosition> positions;
+        std::vector<ShotConfig>   configs;
+        if (!LoadShotList(m_shotListLoadedPath, positions, configs))
+        {
+            m_shotListStatus = "Failed to reload '" + m_shotListLoadedPath.generic_string() +
+                                "' (see log).";
+            return;
+        }
+        m_shotListPositions = std::move(positions);
+        m_shotListConfigs   = std::move(configs);
+        if (m_shotListConfigSelected.size() != m_shotListConfigs.size())
+            m_shotListConfigSelected.assign(m_shotListConfigs.size(), true);
+    };
+
+    ImGui::SetNextWindowSize(ImVec2(420, 560), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(220, 80), ImGuiCond_FirstUseEver);
+    bool open = true;
+    if (!ImGui::Begin("Shot List", &open) || !open)
+    {
+        ImGui::End();
+        if (!open)
+            uiData.showShotListWindow = false;
+        return;
+    }
+
+    // Default to "<scene>.shot_list.json" beside the scene, once per scene; if
+    // absent, the browse dialog still starts in the scene's folder.
+    bool loadRequested = false;
+    const std::string& sceneFile = m_app.GetArgs().meshInputFile;
+    if (m_shotListLoadedPath.empty() && sceneFile != m_shotListDefaultScene)
+    {
+        m_shotListDefaultScene = sceneFile;
+        const std::filesystem::path defaultList = DefaultShotListPath(sceneFile);
+        m_shotListPathBuf = defaultList.generic_string();
+        loadRequested     = std::filesystem::exists(defaultList);
+    }
+
+    char pathBuf[1024] = { 0 };
+    std::strncpy(pathBuf, m_shotListPathBuf.c_str(), std::size(pathBuf) - 1);
+    loadRequested |= ImGui::InputText("##ShotListPath", pathBuf, std::size(pathBuf),
+                                      ImGuiInputTextFlags_EnterReturnsTrue);
+    m_shotListPathBuf = pathBuf;
+    ImGui::SameLine();
+    if (ImGui::Button("Browse..."))
+        loadRequested = FileDialog(true, "Shot lists\0*.json\0All files\0*.*\0\0", m_shotListPathBuf);
+
+    auto load = [this](const std::string& path)
+    {
+        std::vector<ShotPosition> positions;
+        std::vector<ShotConfig>   configs;
+        if (!LoadShotList(path, positions, configs))
+        {
+            m_shotListStatus = "Failed to load '" + path + "' (see log).";
+            return false;
+        }
+        m_shotListLoadedPath      = path;
+        m_shotListPositions       = std::move(positions);
+        m_shotListConfigs         = std::move(configs);
+        m_shotListConfigSelected.assign(m_shotListConfigs.size(), true);
+        m_shotListSelectedPos     = -1;
+        m_shotListStatus          = "Loaded " + std::to_string(m_shotListPositions.size()) +
+                                     " position(s), " + std::to_string(m_shotListConfigs.size()) +
+                                     " config(s).";
+        return true;
+    };
+
+    if (loadRequested && !m_shotListPathBuf.empty())
+        load(m_shotListPathBuf);
+
+    if (!m_shotListStatus.empty())
+        ImGui::TextWrapped("%s", m_shotListStatus.c_str());
+
+    const float exposure = m_app.GetRenderer().GetExposure();
+    // Appends the current camera + exposure to `target`, creating the file if needed.
+    auto addPositionRow = [&](const std::filesystem::path& target)
+    {
+        bool added = false;
+        char labelBuf[256] = { 0 };
+        std::strncpy(labelBuf, m_shotListNewLabelBuf.c_str(), std::size(labelBuf) - 1);
+        ImGui::SetNextItemWidth(200.f);
+        ImGui::InputText("##NewLabel", labelBuf, std::size(labelBuf));
+        m_shotListNewLabelBuf = labelBuf;
+        ImGui::SameLine();
+        ImGui::BeginDisabled(m_shotListNewLabelBuf.empty() || target.empty());
+        if (ImGui::Button("Add Position"))
+        {
+            if (AppendShotPosition(target, m_shotListNewLabelBuf, m_app.GetCameraString(), exposure))
+            {
+                added = true;
+                m_shotListStatus = "Added '" + m_shotListNewLabelBuf + "'.";
+                m_shotListNewLabelBuf.clear();
+            }
+            else
+            {
+                m_shotListStatus = "Failed to save (see log).";
+            }
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Adds the current camera and exposure as a new position,\n"
+                              "labelled with the text on the left.");
+        return added;
+    };
+
+    if (m_shotListLoadedPath.empty())
+    {
+        if (!m_shotListPathBuf.empty() && !std::filesystem::exists(m_shotListPathBuf))
+        {
+            ImGui::TextDisabled("No shot list here yet; adding a position creates it.");
+            if (addPositionRow(m_shotListPathBuf))
+            {
+                const std::string status = m_shotListStatus;
+                if (load(m_shotListPathBuf))
+                {
+                    m_shotListSelectedPos = int(m_shotListPositions.size()) - 1;
+                    m_shotListStatus      = status + " Created " + m_shotListPathBuf + ".";
+                }
+            }
+        }
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Separator();
+    ImGui::TextWrapped("Output: %s", m_app.GetArgs().shotOutDir.c_str());
+    ImGui::TextDisabled("<shotOutDir>/images/<config>/<label>.<tag>.png");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Configs (checked ones are included in Capture):");
+    for (size_t i = 0; i < m_shotListConfigs.size(); ++i)
+    {
+        const ShotConfig& config = m_shotListConfigs[i];
+        std::string        label = config.name + (config.shots.empty()
+            ? " (stats only)"
+            : " (" + std::to_string(config.shots.size()) + " shots)");
+        bool selected = m_shotListConfigSelected[i];
+        if (ImGui::Checkbox(label.c_str(), &selected))
+            m_shotListConfigSelected[i] = selected;
+        ImGui::Indent();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("%s", config.settingsText.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Unindent();
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Positions:");
+    ImGui::BeginChild("ShotListPositions", ImVec2(0, 180), true, ImGuiWindowFlags_HorizontalScrollbar);
+    float labelColumnWidth = 0.f;
+    for (const ShotPosition& pos : m_shotListPositions)
+        labelColumnWidth = std::max(labelColumnWidth, ImGui::CalcTextSize(pos.label.c_str()).x);
+    labelColumnWidth += ImGui::GetStyle().ItemSpacing.x * 2.f;
+    for (int i = 0; i < int(m_shotListPositions.size()); ++i)
+    {
+        const ShotPosition& pos = m_shotListPositions[i];
+        ImGui::PushID(i);
+        // Before the Selectable: a full-width Selectable swallows clicks on
+        // anything placed after it on the same line.
+        ImGui::PushFont(m_iconicFont);
+        const bool jump = ImGui::SmallButton((char const*)(u8"\ue093" "##jump"));
+        ImGui::PopFont();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Jump to this position (camera and exposure).");
+        if (jump)
+        {
+            m_app.JumpCameraToShot(pos);
+            if (pos.exposure > 0.f)
+            {
+                m_app.GetRenderer().SetAutoExposure(false);
+                m_app.GetRenderer().SetExposure(pos.exposure);
+            }
+        }
+        ImGui::SameLine();
+        const float rowX = ImGui::GetCursorPosX();
+        if (ImGui::Selectable("##row", m_shotListSelectedPos == i))
+            m_shotListSelectedPos = i;
+        ImGui::SameLine(rowX);
+        ImGui::TextUnformatted(pos.label.c_str());
+        ImGui::SameLine(rowX + labelColumnWidth);
+        if (pos.exposure > 0.f)
+            ImGui::TextDisabled("%s  exposure %g", pos.camera.c_str(), pos.exposure);
+        else
+            ImGui::TextDisabled("%s", pos.camera.c_str());
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+
+    const bool hasSelection = m_shotListSelectedPos >= 0 &&
+                               m_shotListSelectedPos < int(m_shotListPositions.size());
+
+    if (addPositionRow(m_shotListLoadedPath))
+    {
+        reload();
+        m_shotListSelectedPos = int(m_shotListPositions.size()) - 1;
+    }
+
+    ImGui::BeginDisabled(!hasSelection);
+    if (ImGui::Button("Update Selected"))
+    {
+        if (SaveShotPosition(m_shotListLoadedPath, size_t(m_shotListSelectedPos),
+                             m_app.GetCameraString(), exposure))
+        {
+            reload();
+            m_shotListStatus = "Updated '" + m_shotListPositions[m_shotListSelectedPos].label + "'.";
+        }
+        else
+        {
+            m_shotListStatus = "Failed to save (see log).";
+        }
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Overwrites the selected position with the current camera and exposure.");
+    ImGui::SameLine();
+    if (ImGui::Button("Delete Selected"))
+    {
+        const std::string label = m_shotListPositions[m_shotListSelectedPos].label;
+        if (DeleteShotPosition(m_shotListLoadedPath, size_t(m_shotListSelectedPos)))
+        {
+            reload();
+            m_shotListSelectedPos = -1;
+            m_shotListStatus      = "Deleted '" + label + "'.";
+        }
+        else
+        {
+            m_shotListStatus = "Failed to delete (see log).";
+        }
+    }
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+    const bool running = m_app.IsShotListRunning();
+    ImGui::BeginDisabled(running);
+    if (ImGui::Button("Capture"))
+    {
+        std::vector<ShotConfig> filtered;
+        for (size_t i = 0; i < m_shotListConfigs.size(); ++i)
+            if (m_shotListConfigSelected[i])
+                filtered.push_back(m_shotListConfigs[i]);
+        if (!filtered.empty())
+        {
+            m_shotListRunningConfigCount = filtered.size();
+            m_app.RunShotList(m_shotListPositions, std::move(filtered));
+        }
+        else
+        {
+            m_shotListStatus = "No configs selected to run.";
+        }
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Walks every checked config over every position, then returns\n"
+                          "the camera and view settings to where they were.");
+    if (running)
+    {
+        ImGui::SameLine();
+        ImGui::Text("config %zu/%zu, position %zu/%zu",
+                    m_app.GetShotConfigIndex() + 1, m_shotListRunningConfigCount,
+                    m_app.GetShotPositionIndex() + 1, m_shotListPositions.size());
+        ImGui::SameLine();
+        if (ImGui::Button("Abort"))
+            m_app.AbortShotList();
+    }
+
+    ImGui::End();
+}

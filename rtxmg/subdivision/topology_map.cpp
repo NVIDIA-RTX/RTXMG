@@ -36,6 +36,12 @@ TopologyMap::TopologyMap(
 {
 }
 
+uint64_t TopologyMap::GetVramBytes() const
+{
+    return rtxmg::BufferVramBytes(subpatchTreesArraysBuffer) + rtxmg::BufferVramBytes(patchPointIndicesArraysBuffer)
+         + rtxmg::BufferVramBytes(stencilMatrixArraysBuffer) + rtxmg::BufferVramBytes(plansBuffer);
+}
+
 void TopologyMap::InitDeviceData(std::shared_ptr<donut::engine::DescriptorTableManager> descriptorTable,
     nvrhi::ICommandList* commandList, bool keepHostData)
 {

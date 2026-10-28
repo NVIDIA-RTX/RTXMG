@@ -17,6 +17,7 @@
 #include "rtxmg/cluster_lod/baking/bake_progress.h"
 #include "rtxmg/utils/hash.h"
 #include "rtxmg/utils/parallel_for.h"
+#include "rtxmg/utils/system_memory.h"
 #include "rtxmg/utils/verbosity.h"
 
 #include <algorithm>
@@ -36,14 +37,6 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>  // GlobalMemoryStatusEx, to size the bake worker pool
 
 #include <donut/core/log.h>
 
@@ -1000,8 +993,8 @@ bool LoadManifest(const fs::path& path, const BakerConfig& config,
     if (sizeEc || fileSize < sizeof(ManifestFileHeader))
         return false;
 
-    FILE* f = nullptr;
-    if (fopen_s(&f, path.string().c_str(), "rb") != 0 || !f)
+    FILE* f = fopen(path.string().c_str(), "rb");
+    if (!f)
         return false;
 
     ManifestFileHeader hdr{};
@@ -1048,8 +1041,8 @@ bool SaveManifest(const fs::path& path, const BakerConfig& config,
     fs::path tmp = path;
     tmp += ".tmp";
 
-    FILE* f = nullptr;
-    if (fopen_s(&f, tmp.string().c_str(), "wb") != 0 || !f)
+    FILE* f = fopen(tmp.string().c_str(), "wb");
+    if (!f)
         return false;
 
     std::vector<ManifestRecord> recs;
@@ -1222,16 +1215,15 @@ uint32_t BakeWorkerCount(uint32_t requested)
     if (requested > 0)
         return requested;
 
-    MEMORYSTATUSEX status = {};
-    status.dwLength       = sizeof(status);
-    if (!GlobalMemoryStatusEx(&status))
+    rtxmg::SystemMemory mem;
+    if (!rtxmg::QuerySystemMemory(mem))
         return cores;
 
     // Leave the source mmap and the rest of the process room to breathe.
     constexpr uint64_t kReserveBytes   = 8ull << 30;
     constexpr uint64_t kBytesPerWorker = 2ull << 30;
 
-    const uint64_t total = status.ullTotalPhys;
+    const uint64_t total = mem.totalBytes;
     if (total <= kReserveBytes)
         return 1;
 
