@@ -86,9 +86,12 @@ void main(uint3 gid : SV_DispatchThreadID)
                     if (cachedLevelNeeded == shaderio::kTraversalInvalidLodLevel)
                     {
                         cachedLevelNeeded = lodLevel;
-                        // pretend we already triggered shareLevelMax; sharing
-                        // is unnecessary at/after the cached level
-                        shareLevelMax     = shaderio::kTraversalInvalidLodLevel - 1u;
+                        // sharing is unnecessary at/after the cached level, but an
+                        // election below it still has consumers in between
+                        if (shareLevelMax == shaderio::kTraversalInvalidLodLevel)
+                        {
+                            shareLevelMax = shaderio::kTraversalInvalidLodLevel - 1u;
+                        }
                         // only merge if instances existed before the cached level
                         allowMerge        = numBuildInstances != 0u;
                     }

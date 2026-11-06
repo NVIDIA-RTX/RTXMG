@@ -36,7 +36,7 @@ namespace rtxmg
 
     // What the budget pre-pass measured, for the Memory tab.  Covers only the
     // slots the renderer loads (base color / metallic-roughness / emissive, plus
-    // normal maps under --normalmaps), so it lines up with what reaches VRAM.
+    // normal maps unless --no-normalmaps), so it lines up with what reaches VRAM.
     // textureCount/diskBytes span every
     // format; the budgetable*/keptBytes figures describe the KTX2 subset, the
     // only one whose per-level header index allows dropping a mip undecoded.
@@ -54,7 +54,7 @@ namespace rtxmg
     // Load-time KTX2 mip-budget pre-pass: reads each KTX2 header (no pixel
     // data), solves the waterline against budgetBytes, and writes the chosen base
     // mip per texture into outBaseMips, keyed by the resolved path's
-    // generic_string.  Hand that map to RTXMGScene::SetKtxBaseMips before the
+    // generic_string.  Hand that map to RTXMGScene::SetTextureBaseMips before the
     // scene loads its textures.  Accepts a .gltf or a .scene.json (whose "models"
     // entries are accounted together).  budgetBytes == 0 measures into outStats
     // without dropping any mip; outStats is zeroed up front, so an unreadable

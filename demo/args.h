@@ -371,6 +371,8 @@ struct Args : SceneArgs
     // Wall-clock makes the camera path frame-rate dependent, so only the fixed
     // step can back an image or counter baseline.
     uint32_t dollyFrames = 0;
+    // --dolly-speed <k>: dolly distance per leg as a multiple of the camera fly speed.
+    float dollySpeed = 16.f;
 
     // --anim-step <K>: advance subd animation by K keyframes per rendered frame
     // instead of by wall-clock time, so a run is reproducible.  0 = wall-clock.

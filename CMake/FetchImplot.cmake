@@ -38,6 +38,6 @@ set(implot_srcs
 
 add_library(implot STATIC ${implot_srcs})
 set_target_properties(implot PROPERTIES POSITION_INDEPENDENT_CODE ON)
-add_compile_definitions(implot PRIVATE IMGUI_DEFINE_MATH_OPERATORS)
+target_compile_definitions(implot PUBLIC IMGUI_DEFINE_MATH_OPERATORS)
 target_include_directories(implot PUBLIC "${CMAKE_BINARY_DIR}/_deps/implot-src/")
 target_link_libraries(implot imgui)

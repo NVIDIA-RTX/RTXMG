@@ -15,6 +15,7 @@
 
 // clang-format off
 
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -49,7 +50,10 @@ public:
     void Stop();
 
     std::optional<float> Elapsed();      // returns dt = stop - start
-    std::optional<float> ElapsedAsync(); // returns dt = stop - start
+
+    // Calls sink(ms) once per query resolved since the last call, oldest first.
+    template <typename Sink>
+    void ElapsedAsync(Sink&& sink);
 private:
 
     void ProcessUnresolvedQueries();
@@ -67,7 +71,8 @@ private:
     int32_t m_queryIndex = -1;
     int32_t m_unresolvedQueryIndex = -1;
     float m_lastDuration = 0.f;
-    bool m_hasLastDuration = false;
+    std::array<float, kMaxInFlightQueries> m_resolved = {};
+    uint32_t m_resolvedCount = 0;
 
     enum class State : uint8_t
     {
@@ -77,3 +82,20 @@ private:
         stopped
     } state = State::uninitialized;
 };
+
+template <typename Sink>
+void StopwatchGPU::ElapsedAsync(Sink&& sink)
+{
+    if (state == State::reset || state == State::uninitialized)
+        return;
+
+    // user is responsible for device sync, so we can't track it
+    assert(state != State::ticking);
+
+    state = State::reset;
+
+    ProcessUnresolvedQueries();
+    for (uint32_t i = 0; i < m_resolvedCount; ++i)
+        sink(m_resolved[i] * 1000.0f);
+    m_resolvedCount = 0;
+}

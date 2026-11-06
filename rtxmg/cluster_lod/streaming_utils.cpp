@@ -722,12 +722,6 @@ void StreamingAllocator::Init(nvrhi::IDevice*               device,
     // reset to multiples of sectors
     memory32s = sectorCount * sectorSize32s;
 
-    // Capacity of the used-bits map, NOT upstream's live population count of
-    // set bits - nothing here maintains one.  It only bounds the host-side
-    // freelist dump's scan.  See review K-16 before porting upstream's
-    // allocatedSize-vs-usedBits invariant against it.
-    m_shaderData.usedBitsCount = uint32_t(memory32s);
-
     // The 7 allocator sub-arrays live contiguously inside a single
     // RWByteAddressBuffer, addressed by these per-region byte offsets.  The
     // uint16 freeGapsSize region is 4-byte aligned; its entries stay 2-byte.

@@ -54,6 +54,7 @@
 ////////////////////////////////////////////
 
 RWByteAddressBuffer                           u_AllocatorMem            : register(u1);
+RTXMG_BYTEBUFFER_U64_ALIAS(u_AllocatorMem, register(u1))
 RWStructuredBuffer<uint64_t>                  u_ResidentClasAddresses   : register(u2);
 RWStructuredBuffer<uint>                      u_ResidentClasSizes       : register(u3);
 RWStructuredBuffer<uint2>                     u_ResidentGroupClasSizes  : register(u4);

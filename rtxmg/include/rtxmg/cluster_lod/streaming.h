@@ -15,6 +15,7 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include <vector>
 
 #include <donut/engine/DescriptorTableManager.h>
@@ -26,6 +27,8 @@
 #include "rtxmg/cluster_lod/streaming_hooks.h"    // IClusterLodStreamingHooks
 #include "rtxmg/cluster_lod/streaming_utils.h"    // sub-managers
 #include "rtxmg/profiler/streaming_stats.h"       // StreamingStats (GetStats)
+
+namespace donut::engine { class ThreadPool; }
 
 namespace rtxmg {
 
@@ -281,9 +284,33 @@ private:
     StreamingStats  m_stats               = {};
 
     // Reused by FillStreamingGroupData to expand a compressed group before the
-    // strip rewrite.  Grows to the largest group seen and is freed with the
-    // object; both call sites run on the render thread.
+    // strip rewrite.  Grows to the largest group seen and is freed with the object.
     std::vector<uint8_t> m_decompressScratch;
+
+    // StageLoads fans group sizing and filling out over these workers, so the
+    // page faults on the mmap'd shards overlap instead of stalling one by one.
+    struct LoadFillJob
+    {
+        const GroupInfo* groupInfo;
+        GroupView        groupView;
+        uint32_t         clusterResidentID;
+        uint32_t         groupResidentID;
+        void*            dst;
+        size_t           dstSize;
+        void*            positionsDst;
+        size_t           positionsDstSize;
+    };
+    struct LoadSizes
+    {
+        uint64_t deviceBytes   = 0;
+        uint64_t positionBytes = 0;
+    };
+    struct LoadPoolDeleter { void operator()(donut::engine::ThreadPool* pool) const; };
+    std::unique_ptr<donut::engine::ThreadPool, LoadPoolDeleter> m_loadPool;
+    uint32_t                                                     m_loadWorkers = 0;
+    std::vector<std::vector<uint8_t>>                            m_loadScratch;  // one per worker
+    std::vector<LoadSizes>                                       m_loadSizes;
+    std::vector<LoadFillJob>                                     m_loadFillJobs;
 
     // Persistent scene data.
     std::vector<PersistentGeometry> m_persistentGeometries;

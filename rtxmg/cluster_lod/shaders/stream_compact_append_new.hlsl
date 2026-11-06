@@ -64,6 +64,7 @@ StructuredBuffer<uint64_t>                    t_NewClasAddresses      : register
 // atomic (see shaderio::kStreamingMoveClasSizeByteOffset in shaderio.h and
 // RTXMG_BYTEBUFFER_ATOMIC_ADD_I64 in feature_gates.hlsli).
 RWByteAddressBuffer                           u_StreamingRaw          : register(u0, space1);
+RTXMG_BYTEBUFFER_U64_ALIAS(u_StreamingRaw, register(u0, space1))
 
 ////////////////////////////////////////////
 

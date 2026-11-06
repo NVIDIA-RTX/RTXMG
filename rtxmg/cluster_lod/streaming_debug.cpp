@@ -182,10 +182,11 @@ void ClusterLodStreaming::DebugDumpAllocatorFreelist(nvrhi::ICommandList* comman
                 std::memcpy(&v, mgmt + byteOffset, sizeof(v));
             return uint32_t(v);
         };
+        const uint32_t usedWordCount = a.sectorCount << a.sectorSizeShift;
         uint32_t nonzeroUsedWords = 0;
         uint32_t usedGranules     = 0;
         uint32_t firstUsedWord    = 0xFFFFFFFFu;
-        for (uint32_t i = 0; i < a.usedBitsCount; ++i)
+        for (uint32_t i = 0; i < usedWordCount; ++i)
         {
             const uint32_t bits = loadU32(a.usedBitsByteOffset + i * 4u);
             if (bits)
@@ -236,7 +237,7 @@ void ClusterLodStreaming::DebugDumpAllocatorFreelist(nvrhi::ICommandList* comman
             }
         }
 
-        const uint32_t rawGapCount = std::min(hdr->freeGapsCounter, a.usedBitsCount);
+        const uint32_t rawGapCount = std::min(hdr->freeGapsCounter, usedWordCount);
         std::string rawGaps;
         for (uint32_t i = 0; i < std::min(rawGapCount, 16u); ++i)
         {
@@ -265,7 +266,7 @@ void ClusterLodStreaming::DebugDumpAllocatorFreelist(nvrhi::ICommandList* comman
                             a.sectorCount,
                             a.sectorMaxAllocationSized,
                             nonzeroUsedWords,
-                            a.usedBitsCount,
+                            usedWordCount,
                             usedGranules,
                             firstUsedWord,
                             usedSectorWords.c_str());

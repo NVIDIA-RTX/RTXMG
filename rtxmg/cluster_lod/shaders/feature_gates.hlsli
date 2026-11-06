@@ -70,23 +70,19 @@
 
 
 // --- 64-bit atomic add on a RWByteAddressBuffer byte offset ----------------
-// RWByteAddressBuffer has NO un-suffixed 64-bit InterlockedAdd overload, so a
-// plain `buf.InterlockedAdd(off, int64_t, out int64_t)` silently binds the
-// 32-bit one and truncates the add to the low dword (counters wrap at 4 GB).
-// SM6.6's `InterlockedAdd64` is the correct call, but DXC's SPIR-V backend does
-// not implement it (microsoft/DirectXShaderCompiler#5965), so Vulkan falls back
-// to the truncating overload — it only has to compile, D3D12/DXIL ships.
-// The Vulkan narrowing is written out rather than left implicit: DXC performs
-// it either way, and 12 repeated -Wconversion warnings teach a reader to ignore
-// the shader build instead of reading this comment.  See K-29 for the >4 GB
-// consequence and the host-side guard that would make it loud.
+// The un-suffixed InterlockedAdd binds the 32-bit overload and wraps at 4 GB.
+// DXC's SPIR-V backend lacks InterlockedAdd64 (microsoft/DirectXShaderCompiler#5965),
+// so Vulkan adds through a uint64_t view aliased on the same binding; declare it
+// with RTXMG_BYTEBUFFER_U64_ALIAS.  `off` must be 8-byte aligned.
 #if defined(TARGET_VULKAN)
-#  define RTXMG_BYTEBUFFER_ATOMIC_ADD_I64(buf, off, val, old)      \
-      do {                                                         \
-          uint rtxmgAtomicOld32_;                                   \
-          (buf).InterlockedAdd((off), uint(val), rtxmgAtomicOld32_);\
-          (old) = int64_t(rtxmgAtomicOld32_);                       \
+#  define RTXMG_BYTEBUFFER_U64_ALIAS(buf, reg) RWStructuredBuffer<uint64_t> buf##_U64 : reg;
+#  define RTXMG_BYTEBUFFER_ATOMIC_ADD_I64(buf, off, val, old)                     \
+      do {                                                                        \
+          uint64_t rtxmgAtomicOld64_;                                             \
+          InterlockedAdd(buf##_U64[(off) >> 3], uint64_t(val), rtxmgAtomicOld64_); \
+          (old) = int64_t(rtxmgAtomicOld64_);                                     \
       } while (false)
 #else
+#  define RTXMG_BYTEBUFFER_U64_ALIAS(buf, reg)
 #  define RTXMG_BYTEBUFFER_ATOMIC_ADD_I64(buf, off, val, old) (buf).InterlockedAdd64((off), (val), (old))
 #endif

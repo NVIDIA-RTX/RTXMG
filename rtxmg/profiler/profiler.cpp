@@ -50,8 +50,7 @@ CPUTimer& Profiler::Timer<StopwatchCPU>::Resolve()
 template <>
 GPUTimer& Profiler::Timer<StopwatchGPU>::Resolve()
 {
-    if( auto e = ElapsedAsync() )
-        PushBack( *e );
+    ElapsedAsync( [this]( float e ) { PushBack( e ); } );
     return *this;
 }
 
@@ -68,14 +67,8 @@ CPUTimer& Profiler::Timer<StopwatchCPU>::Profile()
 template <>
 GPUTimer& Profiler::Timer<StopwatchGPU>::Profile()
 {
-    if (Profiler::Get().IsRecording())
-    {
-        auto e = ElapsedAsync();
-        if (e)
-        {
-            PushBack(*e);
-        }
-    }
+    const bool recording = Profiler::Get().IsRecording();
+    ElapsedAsync([this, recording](float e) { if (recording) PushBack(e); });
     return *this;
 }
 

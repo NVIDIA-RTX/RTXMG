@@ -683,6 +683,7 @@ void ClusterLodPreloaded::InitClas(
         // writes each CLAS directly to the VA in inOutAddressesBuffer (pg.clasData).
         {
             clasParams.mode = cluster::OperationMode::ExplicitDestinations;
+            sizeInfo = device->getClusterOperationSizeInfo(clasParams);
 
             cluster::OperationDesc buildDesc = {};
             buildDesc.params             = clasParams;

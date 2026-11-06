@@ -507,7 +507,7 @@ public:
     // before the first UpdateAccelerationStructures re-syncs the flag — so this
     // setter only matters for the scene-load / re-stream ordering.
     void SetEnableClusterLodVertexNormals(bool b)  { m_enableClusterLodVertexNormals = b; }
-    // Cluster-LoD normal-map shading (--normalmaps).  Only reachable on top of
+    // Cluster-LoD normal-map shading (--normalmapshading).  Only reachable on top of
     // the vertex normals above; the permutation resolve below folds that in.
     void SetEnableClusterLodNormalMaps(bool b)     { m_enableClusterLodNormalMaps = b; }
     bool GetEnableClusterLodNormalMaps() const     { return m_enableClusterLodNormalMaps; }

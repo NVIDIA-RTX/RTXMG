@@ -76,6 +76,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstring>
+#include <thread>
 #include <unordered_set>
 
 #include <donut/core/log.h>
@@ -87,6 +88,7 @@
 #include "rtxmg/profiler/statistics.h"  // per-phase Cluster Lod GPU timers (AccelBuilder tab)
 #include "rtxmg/utils/bindless_layout.h"
 #include "rtxmg/utils/cluster_operation.h"
+#include "rtxmg/utils/parallel_for.h"
 
 namespace rtxmg {
 
@@ -1065,7 +1067,7 @@ void ClusterLodStreaming::CheckRequestErrors(const StreamingRequests::TaskInfo& 
 
         if (errorCause)
         {
-            donut::log::fatal("streaming: fatal error - %s frame=%llu rawFrame=%llu task=%u shaderTask=%u rawLoad=%u rawUnload=%u maxLoad=%u maxUnload=%u err(update=%d age=%d oversized=%d notFound=%d list/maxBinCount=%d alloc/maxBinOffset=%d dealloc/freeGaps=%d usedVsAlloc/allocSize=%d) maxSizedLeft=%u usedBytes=%llu wastedBytes=%llu",
+            donut::log::fatal("streaming: fatal error - %s frame=%llu rawFrame=%llu task=%u shaderTask=%u rawLoad=%u rawUnload=%u maxLoad=%u maxUnload=%u err(update=%d age=%d oversized=%d notFound=%d list/maxBinCount=%d alloc/maxBinOffset=%d dealloc/freeGaps=%d usedVsAlloc=%d) maxSizedLeft=%u usedBytes=%llu wastedBytes=%llu",
                               errorCause,
                               (unsigned long long)requestFrame,
                               (unsigned long long)requestFrame,
@@ -1183,6 +1185,11 @@ void ClusterLodStreaming::StageUnloads(const StreamingRequests::TaskInfo& reques
     }
 }
 
+void ClusterLodStreaming::LoadPoolDeleter::operator()(donut::engine::ThreadPool* pool) const
+{
+    delete pool;
+}
+
 ClusterLodStreaming::LoadStageResult
 ClusterLodStreaming::StageLoads(const StreamingRequests::TaskInfo& request,
                                StreamingStorage::TaskInfo&        storageTask,
@@ -1220,12 +1227,41 @@ ClusterLodStreaming::StageLoads(const StreamingRequests::TaskInfo& request,
 
     uint32_t skippedResidentCount = 0;
 
+    // Channel stripping shrinks the pool allocation to the compacted blob;
+    // stripped positions still ride the upload ring for the CLAS build, so
+    // the transfer budget has to cover both.
+    const bool stripPositions = m_config.stripResidentPositions;
+    const bool stripNormals   = m_config.stripResidentNormals;
+
+    if (!m_loadPool)
+    {
+        const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
+        m_loadWorkers = std::clamp(hw / 2, 1u, 16u);
+        m_loadPool.reset(new donut::engine::ThreadPool(m_loadWorkers));
+        m_loadScratch.resize(m_loadWorkers);
+    }
+
+    // Sizing reads each group's cluster headers, the first touch of its shard pages.
+    m_loadSizes.assign(loadCount, {});
+    ParallelFor(*m_loadPool, m_loadWorkers, loadCount, [&](size_t g, uint32_t) {
+        const GeometryGroup geometryGroup = request.loadGeometryGroups[g];
+        assert(geometryGroup.geometryID < m_geometries.size());
+        assert(geometryGroup.groupID < m_geometries[geometryGroup.geometryID].groupInfos.size());
+
+        const GeometryView& sceneGeometry = m_geometries[geometryGroup.geometryID];
+        const GroupInfo&    groupInfo     = sceneGeometry.groupInfos[geometryGroup.groupID];
+        LoadSizes&          sizes         = m_loadSizes[g];
+        sizes.deviceBytes = groupInfo.GetDeviceSize();
+        if (stripPositions || stripNormals)
+            ComputeStrippedGroupSizes(groupInfo, GroupView(sceneGeometry.groupData, groupInfo).clusters.data(),
+                                      stripPositions, stripNormals,
+                                      sizes.deviceBytes, sizes.positionBytes);
+    });
+    m_loadFillJobs.clear();
+
     for (uint32_t g = 0; g < loadCount; g++)
     {
         GeometryGroup geometryGroup = request.loadGeometryGroups[g];
-
-        assert(geometryGroup.geometryID < m_geometries.size());
-        assert(geometryGroup.groupID < m_geometries[geometryGroup.geometryID].groupInfos.size());
 
         if (m_resident.FindGroup(geometryGroup))
         {
@@ -1237,19 +1273,8 @@ ClusterLodStreaming::StageLoads(const StreamingRequests::TaskInfo& request,
         const GeometryView& sceneGeometry = m_geometries[geometryGroup.geometryID];
         const GroupInfo&    groupInfo     = sceneGeometry.groupInfos[geometryGroup.groupID];
         const uint32_t      clusterCount  = uint32_t(groupInfo.clusterCount);
-        const GroupView     groupView(sceneGeometry.groupData, groupInfo);
-
-        // Channel stripping shrinks the pool allocation to the compacted blob;
-        // stripped positions still ride the upload ring for the CLAS build, so
-        // the transfer budget has to cover both.
-        const bool stripPositions = m_config.stripResidentPositions;
-        const bool stripNormals   = m_config.stripResidentNormals;
-        uint64_t groupDeviceSize   = groupInfo.GetDeviceSize();
-        uint64_t groupPositionSize = 0;
-        if (stripPositions || stripNormals)
-            ComputeStrippedGroupSizes(groupInfo, groupView.clusters.data(),
-                                      stripPositions, stripNormals,
-                                      groupDeviceSize, groupPositionSize);
+        const uint64_t      groupDeviceSize   = m_loadSizes[g].deviceBytes;
+        const uint64_t      groupPositionSize = m_loadSizes[g].positionBytes;
 
         uint64_t            groupClasSize = 0;
         bool                canAllocateClas = true;
@@ -1257,15 +1282,16 @@ ClusterLodStreaming::StageLoads(const StreamingRequests::TaskInfo& request,
         if (m_requiresClas)
         {
             groupClasSize = m_clasSingleMaxSize * clusterCount;
-            assert((clasBuildSize + groupClasSize) <= m_clasScratchNewClasSize);
+            // defer the group rather than build past the end of the scratch
+            canAllocateClas = (clasBuildSize + groupClasSize) <= m_clasScratchNewClasSize;
 
             if (m_config.usePersistentClasAllocator)
             {
-                canAllocateClas = clasAllocatedMaxSizedLeft > 0;
+                canAllocateClas = canAllocateClas && clasAllocatedMaxSizedLeft > 0;
             }
             else
             {
-                canAllocateClas = (clasMovedUsedSize + (clasBuildSize + groupClasSize)) <= clasMovedReservedSize;
+                canAllocateClas = canAllocateClas && (clasMovedUsedSize + (clasBuildSize + groupClasSize)) <= clasMovedReservedSize;
             }
         }
 
@@ -1325,12 +1351,10 @@ ClusterLodStreaming::StageLoads(const StreamingRequests::TaskInfo& request,
             positionsPtr = m_storage.AppendHostRead(storageTask, size_t(groupPositionSize), positionsVA);
 
         // groupDeviceSize already accounts for the stripped/uncompressed size.
-        FillStreamingGroupData(groupInfo, groupView, m_decompressScratch,
-                               residentGroup->clusterResidentID,
-                               residentGroup->groupResidentID,
-                               groupData, size_t(groupDeviceSize),
-                               positionsPtr, size_t(groupPositionSize),
-                               stripPositions, stripNormals);
+        m_loadFillJobs.push_back({ &groupInfo, GroupView(sceneGeometry.groupData, groupInfo),
+                                   residentGroup->clusterResidentID, residentGroup->groupResidentID,
+                                   groupData, size_t(groupDeviceSize),
+                                   positionsPtr, size_t(groupPositionSize) });
 
         m_persistentGeometries[geometryGroup.geometryID].lodLoadedGroupsCount[groupInfo.lodLevel]++;
 
@@ -1370,6 +1394,15 @@ ClusterLodStreaming::StageLoads(const StreamingRequests::TaskInfo& request,
 
         transferBytes += groupInfo.sizeBytes;
     }
+
+    ParallelFor(*m_loadPool, m_loadWorkers, m_loadFillJobs.size(), [&](size_t j, uint32_t worker) {
+        const LoadFillJob& job = m_loadFillJobs[j];
+        FillStreamingGroupData(*job.groupInfo, job.groupView, m_loadScratch[worker],
+                               job.clusterResidentID, job.groupResidentID,
+                               job.dst, job.dstSize,
+                               job.positionsDst, job.positionsDstSize,
+                               stripPositions, stripNormals);
+    });
 
     updateTask.newClusterCount = clasBuildOffset;
 
@@ -3258,6 +3291,7 @@ void ClusterLodStreaming::BuildLowDetailClas(nvrhi::IDevice*          device,
     // ----- ExplicitDestinations build → m_clasLowDetailBuffer ----------------
     {
         clasParams.mode = cluster::OperationMode::ExplicitDestinations;
+        clasSizeInfo    = device->getClusterOperationSizeInfo(clasParams);
 
         cluster::OperationDesc buildDesc = {};
         buildDesc.params               = clasParams;

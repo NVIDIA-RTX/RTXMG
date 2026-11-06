@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.1)
 
-project(rtxmg LANGUAGES C CXX VERSION 2.2.0)
+project(rtxmg LANGUAGES C CXX VERSION 2.2.1)
 
 set(CMAKE_CONFIGURATION_TYPES "Debug;Release;RelWithDebInfo;ReleaseAsan" CACHE STRING "Configurations" FORCE)
 set(CMAKE_CXX_STANDARD 23)

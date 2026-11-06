@@ -465,6 +465,7 @@ void ClusterTessellator::InitStructuredClusterTemplates(nvrhi::ICommandList* com
     // Explicit Destination mode, calculate the address offset for each template to get a tight fit
     operationParams.type = cluster::OperationType::ClasBuildTemplates;
     operationParams.mode = cluster::OperationMode::ExplicitDestinations;
+    sizeInfo = m_device->getClusterOperationSizeInfo(operationParams);
 
     nvrhi::GpuVirtualAddress baseAddress = m_templateBuffers.dataBuffer->getGpuVirtualAddress();
     std::vector<nvrhi::GpuVirtualAddress> addresses(kNumTemplates);
@@ -528,7 +529,8 @@ void ClusterTessellator::InitStructuredClusterTemplates(nvrhi::ICommandList* com
     // Execute GetSizes mode to fill out destSizes
     operationParams.type = cluster::OperationType::ClasInstantiateTemplates;
     operationParams.mode = cluster::OperationMode::GetSizes;
-    
+    sizeInfo = m_device->getClusterOperationSizeInfo(operationParams);
+
     cluster::OperationDesc instantiateTemplateGetSizesDesc =
     {
         .params = operationParams,

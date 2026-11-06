@@ -166,8 +166,9 @@ void main(uint3 gid : SV_DispatchThreadID)
         float4x4 transform = mul(g_Constants.traversalViewMatrix, ToFloat4x4(worldMatrix));
 
         // if there is no need to traverse the pen ultimate lod level,
-        // then just insert the last lod level node's cluster directly.
-        if (!TestForTraversal(transform, uniformScale, traversalMetric, errorScale))
+        // then just insert the last lod level node's cluster directly.  A
+        // single-level geometry has no such level; instance_classify_lod agrees.
+        if (childCountMinusOne == 0u || !TestForTraversal(transform, uniformScale, traversalMetric, errorScale))
         {
             // Nothing to enqueue — low-detail BLAS substitution happens
             // implicitly via u_InstanceBlasAddrs below.

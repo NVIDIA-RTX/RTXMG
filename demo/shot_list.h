@@ -111,7 +111,7 @@ struct ShotConfig
     float   lodPixelError    = 0.f;  // 0 = inherit -lpe
     int32_t adaptiveLodError = -1;   // -1 = inherit --adaptive-error, else 0/1
     // Shading only; loading normal maps is a scene-reload setting, so a list
-    // that toggles this has to run with --normalmaps for either state to mean
+    // that toggles this must not run with --no-normalmaps for either state to mean
     // anything.  -1 = inherit --normalmapshading, else 0/1.
     int32_t normalMapShading = -1;
 

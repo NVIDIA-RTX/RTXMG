@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <limits>
 #include <string>
 #include <vector>
@@ -25,14 +26,10 @@
 
 // A generic data sampler with basic statistics functionality
 
-// default running avg window = 1 second @ 60Hz
 template <typename T, size_t _size = 60>
 struct Sampler : public std::array<T, _size>
 {
     std::string name;
-
-    // values tracked in running circular buffer
-    T samples_sum = T( 0 );
 
     // values tracked since most recent reset
     size_t samples_count = 0;
@@ -40,6 +37,8 @@ struct Sampler : public std::array<T, _size>
     T      total         = T( 0 );
     T      min           = std::numeric_limits<T>::max();
     T      max           = std::numeric_limits<T>::lowest();
+
+    std::array<std::chrono::steady_clock::time_point, _size> push_times = {};
 
     void PushBack( T sample );
 
@@ -59,9 +58,24 @@ struct Sampler : public std::array<T, _size>
         return sorted[k];
     }
     T Average() const { return static_cast<T>( double( total ) / double( samples_count ) ); }
+
+    // Mean of the samples pushed in the last second (at least the latest one), so
+    // the UI reads smoothly at any frame rate yet recovers from a spike quickly.
     T RunningAverage() const
     {
-        return static_cast<T>( double( samples_sum ) / double( std::min( samples_count, _size ) ) );
+        const size_t n      = std::min( _size, samples_count );
+        const auto   cutoff = std::chrono::steady_clock::now() - std::chrono::seconds( 1 );
+        T            sum    = T( 0 );
+        size_t       count  = 0;
+        for( size_t i = 1; i <= n; ++i )
+        {
+            const size_t idx = ( samples_count - i ) % _size;
+            if( count > 0 && push_times[idx] < cutoff )
+                break;
+            sum += ( *this )[idx];
+            ++count;
+        }
+        return static_cast<T>( sum / double( count ) );
     }
 
     // current position in circular buffer
@@ -85,16 +99,8 @@ inline void Sampler<T, _size>::PushBack( T sample )
     min = std::min( latest, min );
     max = std::max( latest, max );
 
-    samples_sum += sample;
-
-    if( samples_count < _size )
-        ( *this )[samples_count++] = sample;
-    else
-    {
-        T& oldest = ( *this )[samples_count++ % _size];
-        samples_sum -= oldest;
-        oldest = sample;
-    }
+    push_times[samples_count % _size]  = std::chrono::steady_clock::now();
+    ( *this )[samples_count++ % _size] = sample;
 }
 
 template <typename T, size_t _size>
@@ -102,7 +108,7 @@ inline void Sampler<T, _size>::Reset()
 {
     samples_count = 0;
     latest        = {};
-    samples_sum   = T( 0 );
+    total         = T( 0 );
     min           = std::numeric_limits<T>::max();
     max           = std::numeric_limits<T>::lowest();
 #if !defined( NDEBUG )

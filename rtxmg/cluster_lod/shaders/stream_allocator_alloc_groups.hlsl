@@ -67,6 +67,7 @@
 ////////////////////////////////////////////
 
 RWByteAddressBuffer                           u_AllocatorMem            : register(u1);
+RTXMG_BYTEBUFFER_U64_ALIAS(u_AllocatorMem, register(u1))
 RWStructuredBuffer<uint64_t>                  u_ResidentClasAddresses   : register(u2);
 RWStructuredBuffer<uint>                      u_ResidentClasSizes       : register(u3);
 RWStructuredBuffer<uint2>                     u_ResidentGroupClasSizes  : register(u4);
@@ -347,7 +348,6 @@ void main(uint3 gid : SV_DispatchThreadID)
             streamingRW[0].request.errorClasList        = maxRange.count;
             streamingRW[0].request.errorClasAlloc       = int(maxRange.offset);
             streamingRW[0].request.errorClasDealloc     = int(streamingRW[0].clasAllocator.freeGapsCounter);
-            streamingRW[0].request.errorClasUsedVsAlloc = int(allocSize);
             streamingRW[0].update.moveClasCounter = 0u;
             for (uint c = 0; c < clusterCount; c++)
             {

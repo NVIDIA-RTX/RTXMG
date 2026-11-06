@@ -1,5 +1,44 @@
 # RTX Mega Geometry SDK Change Log
 
+## 2.2.1
+
+Fixes the non-NVIDIA GPU issues reported in
+[#2](https://github.com/NVIDIA-RTX/RTXMG/issues/2).
+
+Cluster LOD
+
+* Read streamed cluster groups on worker threads, so page faults on the cluster cache no
+  longer stall the render thread. On Zorah with a cold file cache, this removes the
+  stalls of up to 100 ms per frame that lasted about 9 seconds while the cache paged in
+  after a load
+* Share BLASes across more instances, and skip LOD traversal for geometries with a single
+  LOD level
+* Make `--lpe-sweep` available in default builds
+
+UI and Profiling
+
+* Average the profiler readouts over the last second, and skip the CPU frame time of the
+  first frame after a load or after the window regains focus
+* Add per-frame CPU, GPU and streaming times to the `--dump-stats` output
+
+Bug Fixes
+
+* When DLSS was unavailable, the samplers were recreated every frame until the D3D12
+  sampler heap ran out and the device was removed. The sample now falls back to no
+  denoiser and grays out the DLSS control
+* CLAS and template builds reused the scratch size from the size query instead of the
+  size for the build mode
+* Cluster tiling ran group barriers in a lane-0 branch, and could drop surfaces when the
+  first wave of a thread group had no surface
+* Vulkan CLAS byte counters wrapped past 4 GB, returning wrong CLAS addresses from the
+  streaming CLAS compactor. It is off by default and enabled only by `--linearalloc` in
+  `RTXMG_DEV_FEATURES` builds
+* `--dump-stats` timing statistics included frames from before a shot-list reset, used a
+  different window for mean/min/max than for median/p95, and left the GPU frame and pass
+  timers empty on headless runs
+* A cluster group load that did not fit the CLAS build scratch asserted instead of
+  waiting for a later frame
+
 ## 2.2.0
 
 Adds **DXR Clusters** support through the preview D3D12 Agility SDK. The D3D12 back-end can

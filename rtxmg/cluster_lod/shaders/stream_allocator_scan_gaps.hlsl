@@ -77,6 +77,7 @@
 #pragma pack_matrix(row_major)
 
 #include "rtxmg/cluster_lod/shaderio.h"
+#include "feature_gates.hlsli"
 #include "rtxmg/utils/wave_size.hlsli"
 
 ////////////////////////////////////////////
@@ -484,4 +485,16 @@ void main(uint3 gid    : SV_DispatchThreadID,
         // entire sector was empty
         AtomicClearUsedSectorBit(sectorID);
     }
+#if TRACK_RENDER_STATS
+    else
+    {
+        // for error checking against AllocatorStats::allocatedSize
+        uint waveUsedBitsCount = WaveActiveSum(sumUsedBitsCount);
+        if (laneID == 0)
+        {
+            uint dummy;
+            InterlockedAdd(streamingRW[0].clasAllocator.usedBitsCount, waveUsedBitsCount, dummy);
+        }
+    }
+#endif
 }

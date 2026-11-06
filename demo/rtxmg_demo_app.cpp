@@ -443,7 +443,7 @@ RTXMGDemoApp::RTXMGDemoApp(app::DeviceManager* deviceManager,
         if (!LoadShotList(m_args.shotListFile, m_shotPositions, m_shotConfigs))
             std::exit(EXIT_FAILURE);  // a malformed list must not silently render nothing
         // Loading normal maps is a scene-reload setting, so a list that toggles
-        // shading is inert without --normalmaps -- and an inert sweep renders N
+        // shading is inert under --no-normalmaps -- and an inert sweep renders N
         // identical configs that look like a real result.
         if (!m_args.enableNormalMaps)
             for (const ShotConfig& config : m_shotConfigs)
@@ -2015,8 +2015,38 @@ void RTXMGDemoApp::CaptureWindowState()
     }
 }
 
+void RTXMGDemoApp::SetTextureLodBias(float lodBias)
+{
+    // Each new sampler misses every BindingCache keyed on it, so only recreate on change.
+    if (lodBias == m_lodBias || std::isnan(lodBias))
+        return;
+    m_lodBias = lodBias;
+
+    GetDevice()->waitForIdle();
+    nvrhi::SamplerDesc samplerDescPoint = m_CommonPasses->m_PointClampSampler->getDesc();
+    nvrhi::SamplerDesc samplerDescLinear = m_CommonPasses->m_LinearClampSampler->getDesc();
+    nvrhi::SamplerDesc samplerDescLinearWrap = m_CommonPasses->m_LinearWrapSampler->getDesc();
+    nvrhi::SamplerDesc samplerDescAniso = m_CommonPasses->m_AnisotropicWrapSampler->getDesc();
+    samplerDescPoint.mipBias = lodBias;
+    samplerDescLinear.mipBias = lodBias;
+    samplerDescLinearWrap.mipBias = lodBias;
+    samplerDescAniso.mipBias = lodBias;
+    m_CommonPasses->m_PointClampSampler = GetDevice()->createSampler(samplerDescPoint);
+    m_CommonPasses->m_LinearClampSampler = GetDevice()->createSampler(samplerDescLinear);
+    m_CommonPasses->m_LinearWrapSampler = GetDevice()->createSampler(samplerDescLinearWrap);
+    m_CommonPasses->m_AnisotropicWrapSampler = GetDevice()->createSampler(samplerDescAniso);
+}
+
 void RTXMGDemoApp::UpdateDLSSSettings()
 {
+    float lodBias = 0.f;
+
+    if (!IsDenoiserModeAvailable(m_denoiserMode))
+    {
+        donut::log::warning("DLSS is not available on this device, disabling the denoiser");
+        SetDenoiserMode(DenoiserMode::None);
+    }
+
 #if DONUT_WITH_STREAMLINE
     using StreamlineInterface = donut::app::StreamlineInterface;
 
@@ -2074,6 +2104,10 @@ void RTXMGDemoApp::UpdateDLSSSettings()
         bool DLSS_resizeRequired = (m_ui.dlssMode != m_dlssLastMode) || (m_displaySize.x != m_dlssLastDisplaySize.x) || (m_displaySize.y != m_dlssLastDisplaySize.y);
         if (DLSS_resizeRequired)
         {
+            // The queries leave the settings untouched when DLSS is unavailable.
+            m_RecommendedDLSSSettings.optimalRenderSize = int2(0);
+            m_RecommendedDLSSRRSettings.optimalRenderSize = int2(0);
+
             // Only quality, target width and height matter here
             streamline.QueryDLSSOptimalSettings(dlssOptions, m_RecommendedDLSSSettings);
             streamline.QueryDLSSRROptimalSettings(dlssRROptions, m_RecommendedDLSSRRSettings);
@@ -2094,30 +2128,11 @@ void RTXMGDemoApp::UpdateDLSSSettings()
             }
         }
 
-        float texLodXDimension = (float)m_renderSize.x;
-
-        // Use the formula of the DLSS programming guide for the Texture LOD Bias...
-        float optimalLodBias = std::log2f(texLodXDimension / m_displaySize.x) - 1;
-        float lodBias = m_ui.dlssUseLodBiasOverride ? m_ui.dlssLodBiasOverride : optimalLodBias;
-        if (lodBias != m_lodBias)
+        if (denoiserMode != DenoiserMode::None)
         {
-            m_lodBias = lodBias;
-
-            GetDevice()->waitForIdle();
-            {
-                nvrhi::SamplerDesc samplerDescPoint = m_CommonPasses->m_PointClampSampler->getDesc();
-                nvrhi::SamplerDesc samplerDescLinear = m_CommonPasses->m_LinearClampSampler->getDesc();
-                nvrhi::SamplerDesc samplerDescLinearWrap = m_CommonPasses->m_LinearWrapSampler->getDesc();
-                nvrhi::SamplerDesc samplerDescAniso = m_CommonPasses->m_AnisotropicWrapSampler->getDesc();
-                samplerDescPoint.mipBias = lodBias;
-                samplerDescLinear.mipBias = lodBias;
-                samplerDescLinearWrap.mipBias = lodBias;
-                samplerDescAniso.mipBias = lodBias;
-                m_CommonPasses->m_PointClampSampler = GetDevice()->createSampler(samplerDescPoint);
-                m_CommonPasses->m_LinearClampSampler = GetDevice()->createSampler(samplerDescLinear);
-                m_CommonPasses->m_LinearWrapSampler = GetDevice()->createSampler(samplerDescLinearWrap);
-                m_CommonPasses->m_AnisotropicWrapSampler = GetDevice()->createSampler(samplerDescAniso);
-            }
+            // Use the formula of the DLSS programming guide for the Texture LOD Bias...
+            float optimalLodBias = std::log2f((float)m_renderSize.x / m_displaySize.x) - 1;
+            lodBias = m_ui.dlssUseLodBiasOverride ? m_ui.dlssLodBiasOverride : optimalLodBias;
         }
     }
 #else
@@ -2128,14 +2143,18 @@ void RTXMGDemoApp::UpdateDLSSSettings()
     if (denoiserMode == DenoiserMode::None)
     {
 #if DONUT_WITH_STREAMLINE
-        StreamlineInterface::DLSSOptions dlssOptions = {};
-        dlssOptions.mode = StreamlineInterface::DLSSMode::eOff;
-        streamline.SetDLSSOptions(dlssOptions);
+        if (streamline.IsDLSSAvailable())
+        {
+            StreamlineInterface::DLSSOptions dlssOptions = {};
+            dlssOptions.mode = StreamlineInterface::DLSSMode::eOff;
+            streamline.SetDLSSOptions(dlssOptions);
+        }
         m_dlssLastMode = StreamlineInterface::DLSSMode::eOff;
 #endif
         m_renderSize = m_displaySize;
-        m_lodBias = 1.0f;
     }
+
+    SetTextureLodBias(lodBias);
 
     // Update effective denoiser mode
     if (m_renderParams.denoiserMode != denoiserMode)
@@ -2295,14 +2314,14 @@ void RTXMGDemoApp::Animate(float fElapsedTimeSeconds)
         }
     }
 
-    // Fixed 1 s out, 1 s back at the camera fly speed.  The period is time-based
-    // rather than a scene-diagonal extent so the turnaround stays watchable on
-    // city-scale scenes (whose diagonal is minutes across).  Translation is applied
+    // Fixed 1 s out, 1 s back at --dolly-speed times the camera fly speed.  The
+    // period is time-based rather than a scene-diagonal extent so the turnaround
+    // stays watchable on city-scale scenes (whose diagonal is minutes across).
+    // Under --shot-list it runs only in each position's Dolly phase.  Translation is applied
     // as a per-frame delta of the triangle wave's integral, so a cycle nets zero
     // even when a frame straddles the turnaround or the speed slider moves.
-    if (m_args.dolly && m_scene)
+    if (m_args.dolly && m_scene && (!IsShotListRunning() || m_shotPhase == ShotPhase::Dolly))
     {
-        constexpr float kDollyHalfPeriod = 1.f;  // seconds per leg
         const float3    forward = m_camera.GetDirection();
         // --dolly-frames pins the step to a fixed 1/N of a leg, which makes the
         // camera path a function of the frame index instead of the frame rate --
@@ -2317,7 +2336,8 @@ void RTXMGDemoApp::Animate(float fElapsedTimeSeconds)
                 const float p = std::fmod(t, 2.f * kDollyHalfPeriod);
                 return (p <= kDollyHalfPeriod) ? p : (2.f * kDollyHalfPeriod - p);
             };
-            const float delta = m_trackBall.MoveSpeed() * (tri(m_dollyTime + dt) - tri(m_dollyTime));
+            const float delta = m_args.dollySpeed * m_trackBall.MoveSpeed()
+                              * (tri(m_dollyTime + dt) - tri(m_dollyTime));
             m_dollyTime += dt;
             if (delta != 0.f)
             {
@@ -2494,10 +2514,16 @@ void RTXMGDemoApp::RenderScene(nvrhi::IFramebuffer* framebuffer)
     renderer.SetRenderCamera(m_camera, m_cameraReset);
     m_sunLight->SetDirection(double3(m_camera.GetDirection()));
 
-    m_prevFrameStart = GetFrameIndex() > 0 ? m_currFrameStart : std::chrono::steady_clock::now();
-    m_currFrameStart = std::chrono::steady_clock::now();
+    // After a frame without RenderScene (unfocused window, loading) the delta would
+    // span the whole gap, so that frame records no time.
+    const auto now          = std::chrono::steady_clock::now();
+    const bool contiguous   = m_currFrameStart != std::chrono::steady_clock::time_point{}
+                              && GetFrameIndex() == m_lastSceneFrameIndex + 1;
+    m_prevFrameStart        = contiguous ? m_currFrameStart : now;
+    m_currFrameStart        = now;
+    m_lastSceneFrameIndex   = GetFrameIndex();
 
-    if (profiler.IsRecording())
+    if (profiler.IsRecording() && contiguous)
         stats::frameSamplers.cpuFrameTime.PushBack(std::chrono::duration<float, std::milli>(m_currFrameStart - m_prevFrameStart).count());
 
     profiler.FrameStart(m_currFrameStart);
@@ -2612,14 +2638,9 @@ void RTXMGDemoApp::RenderScene(nvrhi::IFramebuffer* framebuffer)
 
     profiler.FrameEnd();
 
-    // Only the profiler's Overview graph samples the frame/trace/DLSS timers, so
-    // a --shot-list run with that window closed dumps them empty.  Must follow
-    // executeCommandList: Stop() only records a timestamp write, so resolving
-    // before submission reads whatever the timer's query ring held last -- which
-    // lands different timers on different frames (trace appearing to exceed
-    // frame).  Gated on the walk so an open profiler is not double-sampling.
-    if (ShotListActive())
-        stats::ProfileFrameTimers();
+    // Must follow executeCommandList: Stop() only records a timestamp write, so
+    // resolving earlier reads a stale query and skews timers against each other.
+    stats::ProfileFrameTimers();
 
     // Outside the IsRecording() gate: not a time series, and the Memory tab
     // should read correctly with profiling paused.
@@ -2748,6 +2769,9 @@ void RTXMGDemoApp::RenderScene(nvrhi::IFramebuffer* framebuffer)
                 .residentGroups   = ss.residentGroups,
                 .residentClusters = ss.residentClusters,
                 .blasBuilds       = clc.blasBuildCounter,
+                .cpuFrameMs       = stats::frameSamplers.cpuFrameTime.latest,
+                .gpuFrameMs       = stats::frameSamplers.gpuFrameTime.latest,
+                .hostStreamingMs  = stats::clusterAccelSamplers.clusterLodHostTime.latest,
             });
         }
     }
@@ -2930,7 +2954,21 @@ void RTXMGDemoApp::UpdateShotList()
         m_shotLastResidentGroups   = ~0u;
         m_shotLastResidentClusters = ~0u;
         m_shotLastEffectiveError   = -1.f;
-        m_shotPhase                = ShotPhase::Settle;
+        m_dollyTime                = 0.f;
+        m_shotPhase                = m_args.dolly ? ShotPhase::Dolly : ShotPhase::Settle;
+        break;
+
+    case ShotPhase::Dolly:
+        // Animate advances the camera; after whole cycles, cut back to the exact
+        // pose so float drift cannot move the capture.
+        if (m_dollyTime >= kShotDollyCycles * 2.f * kDollyHalfPeriod)
+        {
+            JumpCameraToShot(pos);
+            renderer.ResetAdaptiveLodError();
+            renderer.ResetSubframes();
+            renderer.ResetDenoiser();
+            m_shotPhase = ShotPhase::Settle;
+        }
         break;
 
     case ShotPhase::Settle:
@@ -3128,9 +3166,8 @@ bool RTXMGDemoApp::QueryVideoMemory(uint64_t& usage, uint64_t& budget) const
 
 // The memory, streaming and timer blocks are sampled live, so they describe a
 // capture point only if written at it -- the run-end dump would report every
-// location as whatever the last one happened to leave behind.  The 60-sample
-// timer window is entirely this location's by now (a pt shot accumulates 128
-// frames here), though min/max still span the run.
+// location as whatever the last one happened to leave behind.  The timers were
+// reset when this location settled, so they cover only its shots.
 void RTXMGDemoApp::DumpPositionStats(const ShotPosition& pos, const ShotConfig& config)
 {
     if (m_args.dumpStatsFile.empty())
@@ -3419,6 +3456,20 @@ void RTXMGDemoApp::SetDollyEnabled(bool e)
     m_args.dolly = e;
     // Reset the accumulator so the dolly restarts from the current position.
     m_dollyTime = 0.f;
+}
+
+bool RTXMGDemoApp::IsDenoiserModeAvailable(DenoiserMode denoiserMode) const
+{
+#if DONUT_WITH_STREAMLINE
+    const donut::app::StreamlineInterface& streamline = donut::app::DeviceManager::GetStreamline();
+    switch (denoiserMode)
+    {
+    case DenoiserMode::DlssSr: return streamline.IsDLSSAvailable();
+    case DenoiserMode::DlssRr: return streamline.IsDLSSRRAvailable();
+    default: break;
+    }
+#endif
+    return denoiserMode == DenoiserMode::None;
 }
 
 void RTXMGDemoApp::SetDenoiserMode(DenoiserMode denoiserMode)

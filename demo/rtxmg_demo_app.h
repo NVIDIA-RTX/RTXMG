@@ -71,6 +71,10 @@ private:
     // triangle wave (delta-translated each frame).  Reset on dolly-enable /
     // ResetCamera so a full cycle nets zero.
     float m_dollyTime = 0.f;
+    static constexpr float kDollyHalfPeriod = 1.f;  // seconds per leg
+    // Under --shot-list, each position dollies this many full cycles, then
+    // cuts back to the position and settles.
+    static constexpr float kShotDollyCycles = 2.f;
 
     // Last value --lpe-sweep pushed to the renderer.  A member, not a function
     // static: a static survives a scene reload and would suppress the re-apply.
@@ -79,11 +83,11 @@ private:
     // --shot-list walk state: every config walked against every position
     // (config outer, so resolution/DLSS/LPE -- which reallocate -- change once
     // per config rather than once per position).  Each position cuts the
-    // camera, waits for streaming residency to go flat, then (if the config has
-    // any) accumulates and captures once per shot.
+    // camera, dollies first under --dolly, waits for streaming residency to go
+    // flat, then (if the config has any) accumulates and captures once per shot.
     std::vector<ShotPosition> m_shotPositions;
     std::vector<ShotConfig>   m_shotConfigs;
-    enum class ShotPhase { Jump, Settle, Accumulate, Done };
+    enum class ShotPhase { Jump, Dolly, Settle, Accumulate, Done };
     ShotPhase m_shotPhase         = ShotPhase::Jump;
     size_t    m_shotConfigIndex   = 0;
     size_t    m_shotPositionIndex = 0;
@@ -247,7 +251,7 @@ private:
     RenderParams m_renderParams = {};
     int2 m_displaySize;
     int2 m_renderSize;
-    float m_lodBias = 1.0f;
+    float m_lodBias = 0.f;
     DenoiserMode m_denoiserMode = DenoiserMode::None; // Desired denoiser mode, but m_renderParams contains effective denoiser mode
 
     int2 m_loadFrameRange = { std::numeric_limits<int>::max(), std::numeric_limits<int>::min() };
@@ -302,6 +306,7 @@ private:
 
     std::chrono::steady_clock::time_point m_currFrameStart = {};
     std::chrono::steady_clock::time_point m_prevFrameStart = {};
+    uint32_t m_lastSceneFrameIndex = 0;
     float m_animationTime = 0.0f;
 
     std::unique_ptr<RTXMGRenderer> m_renderer;
@@ -352,6 +357,7 @@ private:
     static void InstallDeviceRemovedAwareLogCallback();
 
     void UpdateParams();
+    void SetTextureLodBias(float lodBias);
     void UpdateDLSSSettings();
     void LimitFrameRate();
 
@@ -671,6 +677,7 @@ public:
     // Desired denoiser mode
     void SetDenoiserMode(DenoiserMode denoiserMode);
     DenoiserMode GetDenoiserMode() const { return m_denoiserMode; }
+    bool IsDenoiserModeAvailable(DenoiserMode denoiserMode) const;
     DenoiserMode GetEffectiveDenoiserMode() const { return m_renderParams.denoiserMode; }
 
     void NextShadingMode()

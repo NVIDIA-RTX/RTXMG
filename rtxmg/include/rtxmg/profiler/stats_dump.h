@@ -56,6 +56,12 @@ struct FrameRecord
     uint32_t residentGroups   = 0;
     uint32_t residentClusters = 0;
     uint32_t blasBuilds       = 0;
+
+    // Each timer's latest sample when the row is logged; written to `frameTimes`,
+    // not `frameLog`.  GPU values lag the frame by the query read-back latency.
+    float    cpuFrameMs       = 0.f;
+    float    gpuFrameMs       = 0.f;
+    float    hostStreamingMs  = 0.f;
 };
 
 // Off unless --dump-stats asked for it: a long run would grow this unboundedly.

@@ -116,6 +116,7 @@ static void printUsageAndExit(const char* argv0,
         "                          | --dump-stats <file>     Write profiler timings, streaming/memory stats and the per-frame counter ladder to a JSON file at exit\n"
         "                          | --shot-list <file>      Walk a JSON list of capture points (camera, exposure, render modes), settling streaming and accumulation at each, and write a screenshot per point per mode.  Exits when done\n"
         "                          | --shot-out <dir>        Report directory --shot-list writes into: images/ for the captures, stats/ for the per-location dumps.  Default: the shot list's own directory\n"
+        "                          | --lpe-sweep [frames]    Cycle lodPixelError through 1,2,4,8,16,32,16,8,4,2,1 every N frames (default 5; loops)\n"
         "  -tv <true|false>        | --timeview              Enable Timeview (default false)\n"
         "  -vn <true|false>        | --vertexNormals         Enable tessellation (subd) vertex normals computation (default false)\n"
         "  -cvn <true|false>       | --clusterLodVertexNormals     Enable cluster-LoD baked vertex normals shading (default TRUE; keeps normals resident, sized for by the 2 GB geometry pool)\n"
@@ -135,8 +136,8 @@ static void printUsageAndExit(const char* argv0,
         "                          | --nostrip               Cluster-LoD streaming: upload resident group blobs verbatim, with no position/normal stripping\n"
         "                          | --nostrippos            Cluster-LoD streaming: keep positions resident but let normals strip\n"
         "                          | --no-uvquant            Cluster-LoD bake: raw float2 texcoords instead of po2-grid-quantized. Changes the bake, so an existing cache is re-baked\n"
-        "                          | --lpe-sweep [frames]    Cycle lodPixelError through 1,2,4,8,16,32,16,8,4,2,1 every N frames (default 5; loops)\n"
-        "                          | --dolly                 Smooth linear dolly oscillating 1 s forward then 1 s back (loops) at the camera fly speed; reproduces spatial-LoD streaming load/evict transitions\n"
+        "                          | --dolly                 Smooth linear dolly oscillating 1 s forward then 1 s back (loops) at --dolly-speed x the camera fly speed; reproduces spatial-LoD streaming load/evict transitions. With --shot-list, each position dollies 2 cycles, then returns and settles before capturing\n"
+        "                          | --dolly-speed <k>       Dolly distance per leg as a multiple of the camera fly speed (default 16)\n"
         "                          | --dolly-frames <n>      Like --dolly, but advances a fixed 1/n of a leg per frame instead of by wall-clock time, so the camera path is reproducible and can back a baseline\n"
         "                          | --anim-step <k>         Play subd animation at a fixed k keyframes per rendered frame instead of by wall-clock time, so a run is reproducible\n"
         "                          | --anim-dump <dir>       Each frame, write the render-res albedo (alb_NNNN.npy) and motion vectors (mv_NNNN.npy) to <dir>. Stalls the GPU every frame\n"
@@ -213,7 +214,7 @@ void Args::Parse(int argc, char const* const* argv)
         return T(0);
     };
 
-    // Assigned, not appended: Parse runs again on scene load (G-2).
+    // Assigned, not appended: Parse runs again on scene load.
     commandLine.clear();
     for (int i = 0; i < argc; ++i)
         commandLine += (i ? " " : "") + std::string(argv[i]);
@@ -664,8 +665,7 @@ void Args::Parse(int argc, char const* const* argv)
         else if (arg == "--loderrormerge")
         {
             // LOD error propagation (previous additive); BakerConfig defaults to
-            // 1.0 0.0, vk_lod_clusters ships 1.5 0.0.  Changes BakerConfig =>
-            // full rebake, so pair with --cache-dir.
+            // 1.0 0.0.  Changes BakerConfig => full rebake, so pair with --cache-dir.
             parseArgValues(2, [&]() {
                 lodErrorMergePrevious = float(std::stod(argv[++i]));
                 lodErrorMergeAdditive = float(std::stod(argv[++i]));
@@ -679,13 +679,13 @@ void Args::Parse(int argc, char const* const* argv)
         {
             parseArgValues(1, [&]() { bakeWorkers = uint32_t(std::max(0, atoi(argv[++i]))); });
         }
-#if RTXMG_DEV_FEATURES
         else if (arg == "--lpe-sweep")
         {
             lpeSweep = true;
             if (i + 1 < argc && argv[i + 1][0] != '-')
                 lpeSweepFrameInterval = uint32_t(std::max(1, atoi(argv[++i])));
         }
+#if RTXMG_DEV_FEATURES
         else if (arg == "--dolly")
         {
             dolly = true;
@@ -694,6 +694,10 @@ void Args::Parse(int argc, char const* const* argv)
         {
             dolly = true;
             parseArgValues(1, [&]() { dollyFrames = uint32_t(std::max(1, atoi(argv[++i]))); });
+        }
+        else if (arg == "--dolly-speed")
+        {
+            parseArgValues(1, [&]() { dollySpeed = std::max(0.f, float(atof(argv[++i]))); });
         }
         else if (arg == "--anim-step")
         {

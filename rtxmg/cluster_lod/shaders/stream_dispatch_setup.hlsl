@@ -129,6 +129,16 @@ void main()
         streamingRW[0].clasAllocator.dispatchFreeGapsInsert.groupsY = 1u;
         streamingRW[0].clasAllocator.dispatchFreeGapsInsert.groupsZ = 1u;
 
+    #if TRACK_RENDER_STATS
+        // error check allocation state prior adding new groups
+        uint     usedBitsCount = streamingRW[0].clasAllocator.usedBitsCount;
+        uint     granularityShift = streamingRW[0].clasAllocator.granularityByteShift;
+        uint64_t allocatedSize = u_AllocatorMem.Load<uint64_t>(streamingRW[0].clasAllocator.statsByteOffset + 0u);
+        if (usedBitsCount > 0u && allocatedSize != (uint64_t(usedBitsCount) << granularityShift))
+        {
+            streamingRW[0].request.errorClasUsedVsAlloc = int(allocatedSize >> granularityShift) - int(usedBitsCount);
+        }
+    #endif
     }
     else if (setup == shaderio::StreamSetup::AllocatorStatus)
     {

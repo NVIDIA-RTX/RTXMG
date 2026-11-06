@@ -81,7 +81,8 @@ void StopwatchGPU::ProcessUnresolvedQueries()
         // save the last one
         m_unresolvedQueryIndex = unresolvedQueryIndex;
         m_lastDuration = m_device->getTimerQueryTime(m_timerQueries[m_unresolvedQueryIndex]);
-        m_hasLastDuration = true;
+        if (m_resolvedCount < kMaxInFlightQueries)
+            m_resolved[m_resolvedCount++] = m_lastDuration;
         m_device->resetTimerQuery(m_timerQueries[m_unresolvedQueryIndex]);
     }
 }
@@ -97,7 +98,7 @@ void StopwatchGPU::Start(nvrhi::ICommandList* commandList)
         }
         m_queryIndex = -1;
         m_unresolvedQueryIndex = -1;
-        m_hasLastDuration = false;
+        m_resolvedCount = 0;
         state = State::reset;
     }
 
@@ -140,20 +141,4 @@ std::optional<float> StopwatchGPU::Elapsed()
     ProcessUnresolvedQueries();
 
     return m_lastDuration * 1000.0f;
-}
-
-std::optional<float> StopwatchGPU::ElapsedAsync()
-{
-    if (state == State::reset || state == State::uninitialized)
-        return {};
-
-    // user is responsible for device sync, so we can't track it
-    assert(state != State::ticking);
-
-    state = State::reset;
-
-    ProcessUnresolvedQueries();
-    if (m_hasLastDuration)
-        return m_lastDuration * 1000.0f;
-    return {};
 }

@@ -141,8 +141,8 @@ namespace stats
         GPUTimer& blitTime = Profiler::InitTimer<GPUTimer>("GPU/blit (ms)");
 
         // Per-frame Cluster Tess + Cluster LOD total, host-summed from their phase
-        // sub-timers.  mutable because the const BuildUI is what pushes to it.
-        mutable Sampler<float, Profiler::BENCH_FRAME_COUNT> accelBuildTime = { .name = "GPU/accel build (ms)" };
+        // sub-timers.
+        Sampler<float, Profiler::BENCH_FRAME_COUNT> accelBuildTime = { .name = "GPU/accel build (ms)" };
 
         void BuildUI(ImFont *iconicFont, ImPlotContext *plotContext) const;
         // A tab is hidden when the scene cannot produce its data; frame timings always can.
@@ -150,9 +150,8 @@ namespace stats
     };
     extern FrameSamplers frameSamplers;
 
-    // Push this frame's GPU frame / path-trace / DLSS durations into their
-    // samplers.  Normally the profiler's Overview graph does it, so anything
-    // running with that window closed has to call this itself.
+    // Push this frame's frame, pass, accel-build and host-streaming durations into
+    // their samplers.  Call once per frame; the profiler UI only reads them.
     void ProfileFrameTimers();
 
 

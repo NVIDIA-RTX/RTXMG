@@ -38,8 +38,8 @@ std::vector<ShotRecord> shotRecords;
 namespace
 {
 
-// A sampler with no samples reports count 0 and nothing else: its min/max are
-// still the sentinels they were initialized to.
+// Every statistic covers the same retained window (the last `window` samples),
+// so mean and median are never measured over different frames.
 template <typename SamplerType>
 Json::Value SamplerToJson(const SamplerType& s)
 {
@@ -48,9 +48,19 @@ Json::Value SamplerToJson(const SamplerType& s)
     if (s.samples_count == 0)
         return v;
 
-    v["mean"]   = double(s.Average());
-    v["min"]    = double(s.min);
-    v["max"]    = double(s.max);
+    const size_t n = std::min(s.size(), s.samples_count);
+    double sum = 0.0, lo = double(s[0]), hi = double(s[0]);
+    for (size_t i = 0; i < n; ++i)
+    {
+        sum += double(s[i]);
+        lo = std::min(lo, double(s[i]));
+        hi = std::max(hi, double(s[i]));
+    }
+
+    v["window"] = Json::UInt64(n);
+    v["mean"]   = sum / double(n);
+    v["min"]    = lo;
+    v["max"]    = hi;
     v["median"] = double(s.Median());
     v["p95"]    = double(s.Percentile(0.95));
     return v;
@@ -203,6 +213,26 @@ Json::Value FrameLogToJson(const std::vector<FrameRecord>& records)
     return v;
 }
 
+// Kept apart from frameLog, whose columns the harness compares exactly.
+Json::Value FrameTimesToJson(const std::vector<FrameRecord>& records)
+{
+    Json::Value v(Json::objectValue);
+    if (records.empty())
+        return v;
+
+    auto column = [&records](float FrameRecord::*field) {
+        Json::Value col(Json::arrayValue);
+        for (const FrameRecord& r : records)
+            col.append(double(r.*field));
+        return col;
+    };
+
+    v["cpuFrameMs"]      = column(&FrameRecord::cpuFrameMs);
+    v["gpuFrameMs"]      = column(&FrameRecord::gpuFrameMs);
+    v["hostStreamingMs"] = column(&FrameRecord::hostStreamingMs);
+    return v;
+}
+
 }  // anonymous namespace
 
 void ResetTimingSamplers()
@@ -215,6 +245,11 @@ void ResetTimingSamplers()
     frameSamplers.cpuFrameTime.Reset();
     frameSamplers.uiBuildTime.Reset();
     frameSamplers.accelBuildTime.Reset();
+    clusterAccelSamplers.clusterLodTraversal.Reset();
+    clusterAccelSamplers.clusterLodAllocation.Reset();
+    clusterAccelSamplers.clusterLodClasBuild.Reset();
+    clusterAccelSamplers.clusterLodBlasBuild.Reset();
+    clusterAccelSamplers.clusterLodUpload.Reset();
 }
 
 bool DumpToJson(const fs::path& path, const RunIdentity& run)
@@ -223,7 +258,7 @@ bool DumpToJson(const fs::path& path, const RunIdentity& run)
 
     // Bump when a key changes meaning, so the harness rejects a stale baseline
     // instead of silently comparing incompatible fields.
-    root["schemaVersion"] = 1;
+    root["schemaVersion"] = 2;
 
     Json::Value identity(Json::objectValue);
     identity["commandLine"]    = run.commandLine;
@@ -325,7 +360,8 @@ bool DumpToJson(const fs::path& path, const RunIdentity& run)
     streaming["streamFrameCount"]        = Json::UInt64(str.streamFrameCount);
     root["streaming"] = streaming;
 
-    root["frameLog"] = FrameLogToJson(frameLog.records);
+    root["frameLog"]   = FrameLogToJson(frameLog.records);
+    root["frameTimes"] = FrameTimesToJson(frameLog.records);
 
     Json::Value shots(Json::arrayValue);
     for (const ShotRecord& r : shotRecords)

@@ -502,6 +502,60 @@ void GathererWriteCluster(Cluster cluster, uint32_t clusterIndex, GridSampler gr
     u_ClusterTessShadingData[clusterIndex] = shadingData;
 }
 
+#if ENABLE_GROUP_ATOMICS
+// Contains group barriers, so every wave of the group must call it, including waves without a surface.
+bool AllocateGroupStorage(uint32_t iWave, uint32_t iLane,
+    uint32_t clasBlocks, uint32_t clusterCount, uint32_t vertexCount, uint32_t clusterTris,
+    out uint32_t clasBlocksOffset, out uint32_t surfaceClusterOffset, out uint32_t surfaceVertexOffset)
+{
+    uint32_t waveClasBlocksOffset = 0, waveSurfaceClusterOffset = 0, waveSurfaceVertexOffset = 0;
+    if (iLane == 0)
+    {
+        // Coalesce waves into group shared memory
+        uint32_t dummy;
+        InterlockedAdd(s_clasBlocks, clasBlocks, waveClasBlocksOffset);
+        InterlockedAdd(s_clusters, clusterCount, waveSurfaceClusterOffset);
+        InterlockedAdd(s_vertices, vertexCount, waveSurfaceVertexOffset);
+        InterlockedAdd(s_triangles, clusterTris, dummy);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // 1 global atomic per thread group
+    if (iLane == 0 && iWave == 0)
+    {
+        uint32_t dummy;
+        InterlockedAdd(u_TessellationCounters[0].desiredClasBlocks, s_clasBlocks, s_groupClasBlocksOffset);
+        InterlockedAdd(u_TessellationCounters[0].desiredClusters, s_clusters, s_groupClusterOffset);
+        InterlockedAdd(u_TessellationCounters[0].desiredVertices, s_vertices, s_groupVertexOffset);
+        InterlockedAdd(u_TessellationCounters[0].desiredTriangles, s_triangles, dummy);
+
+        bool allocationSucceeded = ((s_groupClasBlocksOffset + s_clasBlocks) <= g_Params.maxClasBlocks) &&
+            ((s_groupClusterOffset + s_clusters) <= g_Params.maxClusters) &&
+            ((s_groupVertexOffset + s_vertices) <= g_Params.maxVertices);
+
+        // If we passed all allocations increment the real cluster counter.
+        // This code used to track allocated clasBlocks, vertices, triangles
+        // but atomics are expensive and it doubled the number of stalls on atomics
+        if (allocationSucceeded)
+        {
+            InterlockedAdd(u_TessellationCounters[0].clusters, s_clusters, s_groupClusterOffset);
+        }
+
+        // write back global offset
+        s_allocationSucceeded = allocationSucceeded;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Read back to each wave
+    clasBlocksOffset = s_groupClasBlocksOffset + waveClasBlocksOffset;
+    surfaceClusterOffset = s_groupClusterOffset + waveSurfaceClusterOffset;
+    surfaceVertexOffset = s_groupVertexOffset + waveSurfaceVertexOffset;
+    return s_allocationSucceeded;
+}
+#endif
+
 void WriteSurfaceWave(uint32_t iWave, uint32_t iLane, uint32_t iSurface, GridSampler rSampler)
 {
     uint32_t waveSampleOffset = kNumWaveSurfaceUVSamples * iWave;
@@ -565,51 +619,8 @@ void WriteSurfaceWave(uint32_t iWave, uint32_t iLane, uint32_t iSurface, GridSam
     }
 
 #if ENABLE_GROUP_ATOMICS
-    uint32_t waveClasBlocksOffset, waveSurfaceClusterOffset, waveSurfaceVertexOffset;
-    if (iLane == 0)
-    {
-        // Coalesce waves into group shared memory
-        uint32_t dummy;
-        InterlockedAdd(s_clasBlocks, clasBlocks, waveClasBlocksOffset);
-        InterlockedAdd(s_clusters, clusterCount, waveSurfaceClusterOffset);
-        InterlockedAdd(s_vertices, vertexCount, waveSurfaceVertexOffset);
-        InterlockedAdd(s_triangles, clusterTris, dummy);
-    
-        GroupMemoryBarrierWithGroupSync();
-    
-        // 1 global atomic per thread group
-        if (iWave == 0)
-        {
-            uint32_t dummy;
-            InterlockedAdd(u_TessellationCounters[0].desiredClasBlocks, s_clasBlocks, s_groupClasBlocksOffset);
-            InterlockedAdd(u_TessellationCounters[0].desiredClusters, s_clusters, s_groupClusterOffset);
-            InterlockedAdd(u_TessellationCounters[0].desiredVertices, s_vertices, s_groupVertexOffset);
-            InterlockedAdd(u_TessellationCounters[0].desiredTriangles, s_triangles, dummy);
-
-            allocationSucceeded = ((s_groupClasBlocksOffset + s_clasBlocks) <= g_Params.maxClasBlocks) &&
-                ((s_groupClusterOffset + s_clusters) <= g_Params.maxClusters) &&
-                ((s_groupVertexOffset + s_vertices) <= g_Params.maxVertices);
-
-            // If we passed all allocations increment the real cluster counter.
-            // This code used to track allocated clasBlocks, vertices, triangles 
-            // but atomics are expensive and it doubled the number of stalls on atomics
-            if (allocationSucceeded)
-            {
-                InterlockedAdd(u_TessellationCounters[0].clusters, s_clusters, s_groupClusterOffset);
-            }
-
-            // write back global offset
-            s_allocationSucceeded = allocationSucceeded;
-        }
-
-        GroupMemoryBarrierWithGroupSync();
-
-        // Read back to each wave
-        clasBlocksOffset = s_groupClasBlocksOffset + waveClasBlocksOffset;
-        surfaceClusterOffset = s_groupClusterOffset + waveSurfaceClusterOffset;
-        surfaceVertexOffset = s_groupVertexOffset + waveSurfaceVertexOffset;
-        allocationSucceeded = s_allocationSucceeded;
-    }
+    allocationSucceeded = AllocateGroupStorage(iWave, iLane, clasBlocks, clusterCount, vertexCount, clusterTris,
+        clasBlocksOffset, surfaceClusterOffset, surfaceVertexOffset);
 #else
     if (iLane == 0)
     {
@@ -707,14 +718,20 @@ void main(uint3 threadIdx : SV_GroupThreadID, uint3 groupIdx : SV_GroupID)
     uint numSurfaceDescriptors, surfaceDescriptorStride;
     t_VertexSurfaceDescriptors.GetDimensions(numSurfaceDescriptors, surfaceDescriptorStride);
 
-    if (iSurface >= g_Params.surfaceEnd)
+    // Skip waves beyond the cluster array end and surfaces that have no limit
+    bool hasSurface = iSurface < g_Params.surfaceEnd;
+    if (hasSurface)
     {
-        return; // early out waves beyond cluster array end
+        hasSurface = HasLimit(iSurface);
     }
 
-    if (!HasLimit(iSurface))
+    if (!hasSurface)
     {
-        return; // don't process surfaces that have no limit
+#if ENABLE_GROUP_ATOMICS
+        uint32_t clasBlocksOffset, surfaceClusterOffset, surfaceVertexOffset;
+        AllocateGroupStorage(iWave, iLane, 0, 0, 0, 0, clasBlocksOffset, surfaceClusterOffset, surfaceVertexOffset);
+#endif
+        return;
     }
 
     SubdivisionEvaluatorHLSL subd;

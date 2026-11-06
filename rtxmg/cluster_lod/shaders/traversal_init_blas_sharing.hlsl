@@ -97,19 +97,20 @@ void main(uint3 gid : SV_DispatchThreadID)
             // (1) low-detail BLAS only — nothing to traverse
             traverseRootNode = false;
         }
+#if USE_BLAS_CACHING
+        else if (instanceLevelMin >= cachedLevel)
+        {
+            // Cached before shared: consumers need no more detail than the
+            // provider, so if it takes the cache they do too.
+            blasBuildIndex   = geometryID | shaderio::BlasBuildIndex::CacheBit;
+            traverseRootNode = false;
+        }
+#endif
         else if (shareInstanceID == instanceID)
         {
             // (2) this instance is the shared provider — traverse + build
             traverseRootNode = true;
         }
-#if USE_BLAS_CACHING
-        else if (instanceLevelMin >= cachedLevel)
-        {
-            // use the geometry's cached BLAS instead
-            blasBuildIndex   = geometryID | shaderio::BlasBuildIndex::CacheBit;
-            traverseRootNode = false;
-        }
-#endif
         else if (instanceLevelMin >= shareLevelMax)
         {
             // (3) consumer — reuse the provider's BLAS

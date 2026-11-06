@@ -200,7 +200,6 @@ bool AppendRenderCluster(bool doAppend, uint offset, uint instanceID, uint clust
 // ---------------------------------------------------------------------------
 
 // Extract uniform scale from the upper-left 3×3 of a row-major float3x4.
-// Equivalent to GLSL computeUniformScale(mat4x3).
 float ComputeUniformScale(float3x4 worldMatrix)
 {
     float3 c0 = float3(worldMatrix[0][0], worldMatrix[1][0], worldMatrix[2][0]);

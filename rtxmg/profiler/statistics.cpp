@@ -40,10 +40,37 @@ namespace stats {
 
     void ProfileFrameTimers()
     {
-        frameSamplers.gpuFrameTime.Profile();
-        frameSamplers.gpuRenderTime.Profile();
-        frameSamplers.gpuDenoiserTime.Profile();
-        frameSamplers.blitTime.Profile();
+        auto& fs = frameSamplers;
+        for (GPUTimer* t : { &fs.gpuFrameTime, &fs.gpuRenderTime, &fs.gpuDenoiserTime, &fs.blitTime,
+                             &fs.computeMotionVectorsTimer, &fs.zRenderPassTime, &fs.zReprojectionTime,
+                             &fs.hiZRenderTime })
+            t->Profile();
+
+        // Cluster Tess and Cluster LOD build sequentially each frame, so their
+        // phase sub-timers sum into one accel-build series.
+        auto& cas = clusterAccelSamplers;
+        auto  last = [](GPUTimer& t) { return t.Profile().latest; };
+        // Only sum a path that actually ran: a path that never dispatched also
+        // never Start/Stop'd its timers, so Profile() resolves garbage queries.
+        float tessLast = 0.f, lodLast = 0.f;
+        if (cas.hasClusterTess)
+            tessLast = last(cas.clusterTilingTime) + last(cas.fillClustersTime)
+                     + last(cas.buildClasTime) + last(cas.buildBlasTime);
+        if (cas.hasClusterLod)
+        {
+            lodLast = last(cas.clusterLodTraversalTime) + last(cas.clusterLodClasBuildTime)
+                    + last(cas.clusterLodClasMovePersistentTime) + last(cas.clusterLodClasMoveCompactionTime)
+                    + last(cas.clusterLodAllocUnloadUpdateTime) + last(cas.clusterLodAllocFreegapsTime)
+                    + last(cas.clusterLodAllocAgeTime) + last(cas.clusterLodAllocLoadTime)
+                    + last(cas.clusterLodAllocStatusTime) + last(cas.clusterLodBlasBuildTime)
+                    + last(cas.clusterLodUploadTime);
+            cas.clusterLodSubmitIdleTime.Profile();
+            cas.clusterLodHostTime.Profile();
+        }
+        const bool  hasAccel = cas.hasClusterTess || cas.hasClusterLod;
+        const float tlasLast = hasAccel ? last(cas.tlasBuildTime) : 0.f;
+        if (Profiler::Get().IsRecording())
+            fs.accelBuildTime.PushBack(tessLast + lodLast + tlasLast);
     }
 
     ClusterAccelSamplers clusterAccelSamplers;
@@ -80,61 +107,30 @@ namespace stats {
         switch (mode)
         {
         case GraphMode::Overview: {
-            timers[0] = &gpuFrameTime.Profile();
-            timers[1] = &gpuRenderTime.Profile();
-            timers[2] = &gpuDenoiserTime.Profile();
-            computeMotionVectorsTimer.Profile();
-            // Resolved in this mode too so the breakdown below accounts for every pass.
-            zRenderPassTime.Profile();
-            hiZRenderTime.Profile();
-            blitTime.Profile();
+            timers[0] = &gpuFrameTime;
+            timers[1] = &gpuRenderTime;
+            timers[2] = &gpuDenoiserTime;
 
-            // Cluster Tess and Cluster LOD build sequentially each frame, so their
-            // phase sub-timers sum into one accel-build series.
             auto& cas = clusterAccelSamplers;
             hasAccel  = cas.hasClusterTess || cas.hasClusterLod;
-            auto last   = [](GPUTimer& t) { return t.Profile().latest; };
             auto avgNan = [](GPUTimer& t) { float v = t.RunningAverage(); return std::isnan(v) ? 0.f : v; };
-            // Only sum a path that actually ran: a path that never dispatched also
-            // never Start/Stop'd its timers, so Profile() resolves garbage queries.
-            float tessLast = 0.f, lodLast = 0.f;
             if (cas.hasClusterTess)
-            {
-                tessLast  = last(cas.clusterTilingTime) + last(cas.fillClustersTime)
-                          + last(cas.buildClasTime) + last(cas.buildBlasTime);
                 tessAvgMs = avgNan(cas.clusterTilingTime) + avgNan(cas.fillClustersTime)
                           + avgNan(cas.buildClasTime) + avgNan(cas.buildBlasTime);
-            }
             if (cas.hasClusterLod)
-            {
-                lodLast  = last(cas.clusterLodTraversalTime) + last(cas.clusterLodClasBuildTime)
-                         + last(cas.clusterLodClasMovePersistentTime) + last(cas.clusterLodClasMoveCompactionTime)
-                         + last(cas.clusterLodAllocUnloadUpdateTime) + last(cas.clusterLodAllocFreegapsTime)
-                         + last(cas.clusterLodAllocAgeTime) + last(cas.clusterLodAllocLoadTime)
-                         + last(cas.clusterLodAllocStatusTime) + last(cas.clusterLodBlasBuildTime)
-                         + last(cas.clusterLodUploadTime);
                 lodAvgMs = avgNan(cas.clusterLodTraversalTime) + avgNan(cas.clusterLodClasBuildTime)
                          + avgNan(cas.clusterLodClasMovePersistentTime) + avgNan(cas.clusterLodClasMoveCompactionTime)
                          + avgNan(cas.clusterLodAllocUnloadUpdateTime) + avgNan(cas.clusterLodAllocFreegapsTime)
                          + avgNan(cas.clusterLodAllocAgeTime) + avgNan(cas.clusterLodAllocLoadTime)
                          + avgNan(cas.clusterLodAllocStatusTime) + avgNan(cas.clusterLodBlasBuildTime)
                          + avgNan(cas.clusterLodUploadTime);
-            }
             // TLAS refresh + instance-desc fill runs for both paths.
-            const float tlasLast = hasAccel ? last(cas.tlasBuildTime) : 0.f;
             tlasAvgMs = hasAccel ? avgNan(cas.tlasBuildTime) : 0.f;
-            if (cas.hasClusterLod)
-            {
-                cas.clusterLodSubmitIdleTime.Profile();
-                cas.clusterLodHostTime.Profile();
-            }
-            if (Profiler::Get().IsRecording())
-                accelBuildTime.PushBack(tessLast + lodLast + tlasLast);
         } break;
         case GraphMode::HiZ: {
-            timers[0] = &zRenderPassTime.Profile();
-            timers[1] = &zReprojectionTime.Profile();
-            timers[2] = &hiZRenderTime.Profile();
+            timers[0] = &zRenderPassTime;
+            timers[1] = &zReprojectionTime;
+            timers[2] = &hiZRenderTime;
         } break;
         default:
             return;
@@ -401,11 +397,10 @@ namespace stats {
         // ============================= Cluster Tess ==========================
         if (hasClusterTess)
         {
-            // Profiled once here, then reused by the timing and throughput plots.
-            auto const& clusterTiling = clusterTilingTime.Profile();
-            auto const& fillClusters  = fillClustersTime.Profile();
-            auto const& buildClas     = buildClasTime.Profile();
-            auto const& buildBlas     = buildBlasTime.Profile();
+            auto const& clusterTiling = clusterTilingTime;
+            auto const& fillClusters  = fillClustersTime;
+            auto const& buildClas     = buildClasTime;
+            auto const& buildBlas     = buildBlasTime;
 
             if (ImPlot::BeginPlot("##accel_builder_tess", ImVec2(-1, 150 * fontScale)))
             {

@@ -236,7 +236,7 @@ namespace rtxmg
             texDims.emplace_back(width, height);
         };
 
-        // glTF: base color, metallic-roughness, emissive and (under --normalmaps)
+        // glTF: base color, metallic-roughness, emissive and (unless --no-normalmaps)
         // normal, matching what RTXMGScene's importer loads.
         auto accountGltf = [&](const fs::path& gltfFile)
         {

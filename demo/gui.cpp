@@ -1790,20 +1790,27 @@ void UserInterface::BuildDenoiserSection()
 
         DenoiserMode denoiserMode = m_app.GetDenoiserMode();
 #if ENABLE_DLSS_SR
+        const bool dlssAvailable = m_app.IsDenoiserModeAvailable(DenoiserMode::DlssSr) ||
+            m_app.IsDenoiserModeAvailable(DenoiserMode::DlssRr);
+        ImGui::BeginDisabled(!dlssAvailable);
         if (ImGui::Combo("Denoiser Mode", (int*)&denoiserMode, "None\0DLSS-SR\0DLSS-RR\0"))
         {
             m_app.SetDenoiserMode(denoiserMode);
         }
-        if (ImGui::IsItemHovered() && ImGui::GetCurrentContext()->HoveredIdTimer > .5f)
-            ImGui::SetTooltip("Set Denoiser mode");
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && ImGui::GetCurrentContext()->HoveredIdTimer > .5f)
+            ImGui::SetTooltip(dlssAvailable ? "Set Denoiser mode" : "DLSS is not available on this device.");
 #else
+        const bool dlssAvailable = m_app.IsDenoiserModeAvailable(DenoiserMode::DlssRr);
         bool isDlssEnabled = denoiserMode == DenoiserMode::DlssRr;
+        ImGui::BeginDisabled(!dlssAvailable);
         if (ImGui::Checkbox("Enable DLSS-RR", &isDlssEnabled))
         {
             m_app.SetDenoiserMode(isDlssEnabled ? DenoiserMode::DlssRr : DenoiserMode::None);
         }
-        if (ImGui::IsItemHovered() && ImGui::GetCurrentContext()->HoveredIdTimer > .5f)
-            ImGui::SetTooltip("Enable DLSS-RR for upscale and denoising");
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && ImGui::GetCurrentContext()->HoveredIdTimer > .5f)
+            ImGui::SetTooltip(dlssAvailable ? "Enable DLSS-RR for upscale and denoising" : "DLSS-RR is not available on this device.");
 #endif
 
         if (denoiserMode != DenoiserMode::None)

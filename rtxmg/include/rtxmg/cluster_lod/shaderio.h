@@ -382,7 +382,7 @@ static_assert(sizeof(RenderInstance) == 128, "RenderInstance must be 128 bytes")
 
 // ---------------------------------------------------------------------------
 // Item descriptor for the LOD traversal producer/consumer queue.
-// Fits in two uint32s (treated as uint2 in HLSL, uint64 in GLSL).
+// Fits in two uint32s (treated as uint2 in HLSL).
 // ---------------------------------------------------------------------------
 struct TraversalInfo
 {
@@ -627,14 +627,14 @@ static_assert(sizeof(GeometryBuildInfo) == 16, "GeometryBuildInfo must be 16 byt
 // ===========================================================================
 // Persistent CLAS streaming allocator shaderio.
 //
-// The GLSL→HLSL mapping conventions the structs below are cited against:
-//   (a) BUFFER_REF arrays → explicitly bound (RW)StructuredBuffer<T>; the
-//       BUFFER_REF field is dropped from the scalar header.
-//   (b) Pool addresses → (uint32 bindless SRV slot, uint32 byteOffset), since
+// Conventions the structs below are cited against:
+//   (a) Per-element arrays are explicitly bound (RW)StructuredBuffer<T>s, not
+//       fields of the scalar header.
+//   (b) Pool addresses are (uint32 bindless SRV slot, uint32 byteOffset), since
 //       HLSL cannot dereference a raw VA.
-//   (c) BLAS-build-hardware seam → uint64 VAs (CLAS addresses).
-//   (d) BUFFER_REF inside StreamingAllocator's management buffer →
-//       uint32 byte offsets into a single RWByteAddressBuffer.
+//   (c) Addresses handed to the cluster/BLAS build APIs are uint64 VAs.
+//   (d) StreamingAllocator's sub-arrays are uint32 byte offsets into a single
+//       RWByteAddressBuffer.
 // ===========================================================================
 
 // Bit-array word size: must be 32 so usedBits / freeGaps processing is u32-
@@ -1015,11 +1015,9 @@ SHADERIO_ASSERT_NO_TAIL_PADDING(SceneStreaming, clasAllocator);
 #endif
 
 // Byte offset of update.moveClasSize within SceneStreaming.  The compaction
-// shaders bump this 64-bit cursor via RWByteAddressBuffer.InterlockedAdd on a
-// raw view of the aggregate: a free-function 64-bit InterlockedAdd on a nested
-// field of a RWStructuredBuffer does not lower to a correct atomic (garbage
-// addresses, TDR), and the explicit `InterlockedAdd64` spelling is unimplemented
-// in DXC's SPIR-V backend.
+// shaders bump this 64-bit cursor through a raw view of the aggregate
+// (RTXMG_BYTEBUFFER_ATOMIC_ADD_I64): a free-function 64-bit InterlockedAdd on a
+// nested field of a RWStructuredBuffer does not lower to a correct atomic.
 //
 // Must be a hand-written literal — HLSL has no `offsetof` — so the static_assert
 // below is what keeps it honest against layout changes.
